@@ -1,0 +1,20 @@
+# Dependencias de la Azure Function `mp_webhook_function`.
+#
+# IMPORTANTE: construir primero el wheel de shared con `.\build_shared_wheel.ps1`
+# desde la raíz del repo. El script copia el wheel a esta carpeta, y la línea
+# siguiente lo instala localmente para que lo empaquete `func pack`.
+
+azure-functions==1.21.3
+
+# Wheel local con el código compartido (SecretString, AppConfig, execute_upsert, sanitize_to_json).
+# El nombre exacto lo produce build_shared_wheel.ps1.
+./interbanking_mp_shared-0.1.0-py3-none-any.whl
+
+# HTTP + DB
+requests==2.32.3
+pyodbc==5.1.0
+python-dateutil==2.9.0.post0
+
+# Observabilidad — autoinstrumentación Application Insights (OPS-01).
+opencensus-ext-azure==1.1.13
+python-json-logger==2.0.7

@@ -1,0 +1,17 @@
+[Unit]
+Description=Servicio integrado Mercado Pago + Interbanking
+After=network.target
+
+[Service]
+Type=simple
+User=opc
+WorkingDirectory=/opt/finance-sync
+EnvironmentFile=/opt/finance-sync/.env
+ExecStart=/opt/finance-sync/venv/bin/python /opt/finance-sync/unified_finance_sync_service.py daemon
+Restart=always
+RestartSec=15
+StandardOutput=append:/var/log/finance-sync.log
+StandardError=append:/var/log/finance-sync.log
+
+[Install]
+WantedBy=multi-user.target

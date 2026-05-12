@@ -1,0 +1,21 @@
+# Dependencias de la Azure Function `ib_poller` (Timer trigger).
+#
+# IMPORTANTE: construir primero el wheel de shared con `.\build_shared_wheel.ps1`
+# desde la raíz del repo.
+
+azure-functions==1.21.3
+
+# Wheel local con el código compartido.
+./interbanking_mp_shared-0.1.0-py3-none-any.whl
+
+# HTTP + datos
+requests==2.32.3
+pandas==2.2.3
+python-dateutil==2.9.0.post0
+
+# DB
+pyodbc==5.1.0
+
+# Observabilidad
+opencensus-ext-azure==1.1.13
+python-json-logger==2.0.7

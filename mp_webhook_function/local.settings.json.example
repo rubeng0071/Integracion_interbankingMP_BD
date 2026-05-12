@@ -1,0 +1,27 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "_COMMENT_1": "Solo para DESARROLLO local. En Azure, todos los secretos van en Key Vault y la Function los lee con Managed Identity (AZURE_KEY_VAULT_URI).",
+    "_COMMENT_2": "Copiá este archivo a local.settings.json (gitignored) y reemplazá los valores.",
+
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "FUNCTIONS_EXTENSION_VERSION": "~4",
+
+    "AZURE_KEY_VAULT_URI": "",
+
+    "SQL_CONNECTION_STRING": "DRIVER={ODBC Driver 18 for SQL Server};SERVER=tu-servidor.database.windows.net;DATABASE=finance;UID=finance_svc;PWD=cambiar;Encrypt=yes;TrustServerCertificate=no;",
+    "MP_ACCESS_TOKEN": "APP_USR_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "MP_WEBHOOK_SECRET": "cambiar_cuando_se_active_el_webhook",
+
+    "_COMMENT_3": "Estas vars son requeridas por AppConfig pero no las usa esta Function (son del poller IB).",
+    "IB_CLIENT_ID": "unused_in_webhook",
+    "IB_CLIENT_SECRET": "unused_in_webhook",
+    "IB_SERVICE_URL": "https://example.com/callback",
+    "IB_CUSTOMER_ID": "0",
+
+    "LOG_LEVEL": "INFO",
+
+    "APPLICATIONINSIGHTS_CONNECTION_STRING": ""
+  }
+}

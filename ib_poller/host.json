@@ -1,0 +1,31 @@
+{
+  "version": "2.0",
+  "logging": {
+    "applicationInsights": {
+      "samplingSettings": {
+        "isEnabled": true,
+        "maxTelemetryItemsPerSecond": 20,
+        "excludedTypes": "Request;Exception"
+      }
+    },
+    "logLevel": {
+      "default": "Information",
+      "Host.Aggregator": "Trace",
+      "Function": "Information"
+    }
+  },
+  "_comment_timeout": "El poller procesa todas las cuentas + balances + movimientos + transferencias + extractos. Dejamos margen de 10 min.",
+  "functionTimeout": "00:10:00",
+  "_comment_singleton": "Forzamos que solo corra UNA instancia a la vez para evitar dos polls solapados.",
+  "singleton": {
+    "lockPeriod": "00:00:15",
+    "listenerLockPeriod": "00:01:00",
+    "listenerLockRecoveryPollingInterval": "00:01:00",
+    "lockAcquisitionTimeout": "00:01:00",
+    "lockAcquisitionPollingInterval": "00:00:03"
+  },
+  "extensionBundle": {
+    "id": "Microsoft.Azure.Functions.ExtensionBundle",
+    "version": "[4.*, 5.0.0)"
+  }
+}

@@ -1,0 +1,54 @@
+# Empaqueta el paquete `shared/` como wheel distribuible.
+#
+# Build:
+#     python -m pip install --upgrade build
+#     python -m build --wheel
+#
+# Salida: ./dist/interbanking_mp_shared-0.1.0-py3-none-any.whl
+#
+# Los componentes Azure (mp_webhook_function/, ib_poller/) copian ese wheel
+# a su carpeta local y lo referencian en requirements.txt:
+#     ./interbanking_mp_shared-0.1.0-py3-none-any.whl
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "interbanking-mp-shared"
+version = "0.1.0"
+description = "Código compartido entre mp_webhook_function e ib_poller (secretos, helpers DB, config)"
+readme = "shared/README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [
+    { name = "Rapanui" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "License :: Other/Proprietary License",
+]
+
+# Dependencias mínimas de `shared`.
+# NO incluir pandas/pyodbc acá: cada componente las declara en su requirements.txt.
+dependencies = [
+    "azure-identity>=1.15.0,<2.0.0",
+    "azure-keyvault-secrets>=4.7.0,<5.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=5.0.0",
+    "build>=1.0.0",
+]
+
+[tool.setuptools]
+# Empaquetamos solo la carpeta `shared/` (no main_interactive.py, etc.).
+packages = ["shared"]
+
+[tool.setuptools.package-data]
+shared = ["py.typed"]
