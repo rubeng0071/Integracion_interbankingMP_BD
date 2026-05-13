@@ -271,7 +271,24 @@ class IBProcessor:
     def __init__(self, config: IbPollerConfig) -> None:
         self.config = config
         self.db = Database(config.sql_connection_string.reveal())
-        self.client = InterbankingClient()
+        # Inyectamos las credenciales desde el config en vez de que el cliente
+        # las re-lea de os.environ. Asi Key Vault sigue siendo la fuente unica
+        # de verdad: si un secret se rota en KV, basta con reciclar la Function
+        # (no hay un segundo lugar donde se haya cacheado el valor).
+        self.client = InterbankingClient(
+            client_id=config.ib_client_id.reveal(),
+            client_secret=config.ib_client_secret,
+            service_url=config.ib_service_url,
+            customer_id=config.ib_customer_id,
+            token_url=config.ib_token_url,
+            api_base_url=config.ib_api_base_url,
+            grant_type=config.ib_grant_type,
+            username=config.ib_username,
+            password=config.ib_password,
+            scope=config.ib_scope,
+            page_size=config.ib_page_size,
+            timeout=config.ib_timeout_seconds,
+        )
 
     # ------------------------------------------------------------------
     # Helpers internos

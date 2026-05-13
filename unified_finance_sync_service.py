@@ -512,7 +512,7 @@ class InterbankingSync:
         if InterbankingClient is None:
             raise RuntimeError("No se pudo importar InterbankingClient. Copia este script dentro del proyecto donde ya funciona la conexión.")
         self.db = db
-        self.client = InterbankingClient()
+        self.client = InterbankingClient.from_env()
         self.config = config
 
     def _window(self, process_name: str) -> Tuple[str, str]:

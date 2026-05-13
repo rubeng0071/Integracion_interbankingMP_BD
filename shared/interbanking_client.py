@@ -475,23 +475,46 @@ class InterbankingClient:
     compatibilidad con el servicio unificado y acceso al response completo.
     """
 
-    def __init__(self) -> None:
-        self.client_id     = os.environ["IB_CLIENT_ID"]
+    def __init__(
+        self,
+        *,
+        client_id: str,
+        client_secret: SecretString,
+        service_url: str,
+        customer_id: str,
+        token_url: str = _DEFAULT_TOKEN_URL,
+        api_base_url: str = _DEFAULT_API_BASE,
+        grant_type: str = "client_credentials",
+        username: Optional[SecretString] = None,
+        password: Optional[SecretString] = None,
+        scope: str = _DEFAULT_SCOPE,
+        page_size: int = 100,
+        timeout: int = 60,
+    ) -> None:
+        """Constructor explícito: todas las credenciales se inyectan.
+
+        Para cargar desde variables de entorno (uso legacy o REPL), usar
+        InterbankingClient.from_env(). Esto desacopla el cliente del
+        global state de os.environ y lo hace testeable con valores
+        controlados sin monkeypatch.
+        """
+        if not isinstance(client_secret, SecretString):
+            raise TypeError("client_secret debe ser SecretString")
+
+        self.client_id     = client_id
         # SEC-07: client_secret nunca debe aparecer como str plano en self.
-        self.client_secret: SecretString = SecretString(os.environ["IB_CLIENT_SECRET"])
-        self.service_url   = os.environ["IB_SERVICE_URL"]
-        self.customer_id   = os.environ["IB_CUSTOMER_ID"]
-        self.token_url     = os.getenv("IB_TOKEN_URL",    _DEFAULT_TOKEN_URL)
-        self.api_base_url  = os.getenv("IB_API_BASE_URL", _DEFAULT_API_BASE).rstrip("/")
-        self.grant_type    = os.getenv("IB_GRANT_TYPE",   "client_credentials")
+        self.client_secret = client_secret
+        self.service_url   = service_url
+        self.customer_id   = customer_id
+        self.token_url     = token_url
+        self.api_base_url  = api_base_url.rstrip("/")
+        self.grant_type    = grant_type
         # username puede contener identificación operativa, password obviamente sensible.
-        _raw_username      = os.getenv("IB_USERNAME")
-        _raw_password      = os.getenv("IB_PASSWORD")
-        self.username: Optional[SecretString] = SecretString(_raw_username) if _raw_username else None
-        self.password: Optional[SecretString] = SecretString(_raw_password) if _raw_password else None
-        self.scope         = os.getenv("IB_SCOPE",        _DEFAULT_SCOPE)
-        self.page_size     = int(os.getenv("IB_PAGE_SIZE",       "100"))
-        self.timeout       = int(os.getenv("IB_TIMEOUT_SECONDS", "60"))
+        self.username      = username
+        self.password      = password
+        self.scope         = scope
+        self.page_size     = page_size
+        self.timeout       = timeout
 
         # SEC-07: el access_token también va envuelto. Para usarlo: ._access_token.reveal()
         self._access_token: Optional[SecretString] = None
@@ -500,6 +523,34 @@ class InterbankingClient:
         retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         self.session = requests.Session()
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
+
+    @classmethod
+    def from_env(cls) -> "InterbankingClient":
+        """Construye el cliente leyendo de variables de entorno.
+
+        Útil para el código legacy (monolítico, CLI interactiva) que ya
+        confía en os.environ. Para Azure Functions preferí construir el
+        cliente con los valores resueltos del IbPollerConfig.
+
+        Raises:
+            KeyError: si falta alguna variable de entorno requerida.
+        """
+        _raw_username = os.getenv("IB_USERNAME")
+        _raw_password = os.getenv("IB_PASSWORD")
+        return cls(
+            client_id=os.environ["IB_CLIENT_ID"],
+            client_secret=SecretString(os.environ["IB_CLIENT_SECRET"]),
+            service_url=os.environ["IB_SERVICE_URL"],
+            customer_id=os.environ["IB_CUSTOMER_ID"],
+            token_url=os.getenv("IB_TOKEN_URL", _DEFAULT_TOKEN_URL),
+            api_base_url=os.getenv("IB_API_BASE_URL", _DEFAULT_API_BASE),
+            grant_type=os.getenv("IB_GRANT_TYPE", "client_credentials"),
+            username=SecretString(_raw_username) if _raw_username else None,
+            password=SecretString(_raw_password) if _raw_password else None,
+            scope=os.getenv("IB_SCOPE", _DEFAULT_SCOPE),
+            page_size=int(os.getenv("IB_PAGE_SIZE", "100")),
+            timeout=int(os.getenv("IB_TIMEOUT_SECONDS", "60")),
+        )
 
     # ------------------------------------------------------------------
     # Autenticación

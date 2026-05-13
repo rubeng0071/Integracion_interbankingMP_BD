@@ -543,7 +543,7 @@ def main():
     
     try:
         # Crear cliente
-        client = InterbankingClient()
+        client = InterbankingClient.from_env()
         
         # Probar conexión
         if not client.test_connection():
