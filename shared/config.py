@@ -127,6 +127,22 @@ class AppConfig:
             ib_username = _optional_secret("IB_USERNAME")
             ib_password = _optional_secret("IB_PASSWORD")
 
+        # Parseo de enteros ANTES del check de errores: _int_env appendea a
+        # `errors` cuando el valor no es entero, así que tienen que evaluarse
+        # antes de la condición que dispara ConfigError. (Antes vivían dentro
+        # del `return cls(...)`, lo que dejaba los errores silenciosamente
+        # descartados y la config caía al default sin avisar.)
+        ib_page_size = _int_env("IB_PAGE_SIZE", cls.ib_page_size)
+        ib_timeout_seconds = _int_env("IB_TIMEOUT_SECONDS", cls.ib_timeout_seconds)
+        poll_interval_seconds = _int_env("POLL_INTERVAL_SECONDS", cls.poll_interval_seconds)
+        mp_initial_lookback_days = _int_env("MP_INITIAL_LOOKBACK_DAYS", cls.mp_initial_lookback_days)
+        mp_incremental_lookback_hours = _int_env(
+            "MP_INCREMENTAL_LOOKBACK_HOURS", cls.mp_incremental_lookback_hours
+        )
+        ib_incremental_lookback_days = _int_env(
+            "IB_INCREMENTAL_LOOKBACK_DAYS", cls.ib_incremental_lookback_days
+        )
+
         if errors:
             header = "Configuración inválida. Variables faltantes o erróneas:\n"
             tip = (
@@ -149,12 +165,12 @@ class AppConfig:
             ib_token_url=os.getenv("IB_TOKEN_URL", cls.ib_token_url),
             ib_api_base_url=os.getenv("IB_API_BASE_URL", cls.ib_api_base_url).rstrip("/"),
             ib_scope=os.getenv("IB_SCOPE", cls.ib_scope),
-            ib_page_size=_int_env("IB_PAGE_SIZE", cls.ib_page_size),
-            ib_timeout_seconds=_int_env("IB_TIMEOUT_SECONDS", cls.ib_timeout_seconds),
-            poll_interval_seconds=_int_env("POLL_INTERVAL_SECONDS", cls.poll_interval_seconds),
-            mp_initial_lookback_days=_int_env("MP_INITIAL_LOOKBACK_DAYS", cls.mp_initial_lookback_days),
-            mp_incremental_lookback_hours=_int_env("MP_INCREMENTAL_LOOKBACK_HOURS", cls.mp_incremental_lookback_hours),
-            ib_incremental_lookback_days=_int_env("IB_INCREMENTAL_LOOKBACK_DAYS", cls.ib_incremental_lookback_days),
+            ib_page_size=ib_page_size,
+            ib_timeout_seconds=ib_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            mp_initial_lookback_days=mp_initial_lookback_days,
+            mp_incremental_lookback_hours=mp_incremental_lookback_hours,
+            ib_incremental_lookback_days=ib_incremental_lookback_days,
             log_level=os.getenv("LOG_LEVEL", cls.log_level),
             output_dir=os.getenv("OUTPUT_DIR", cls.output_dir),
             azure_key_vault_uri=os.getenv("AZURE_KEY_VAULT_URI"),
