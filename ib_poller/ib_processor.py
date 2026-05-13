@@ -24,7 +24,7 @@ import pyodbc
 from dateutil import parser as dtparser
 
 from shared.config import IbPollerConfig
-from shared.db_helpers import execute_upsert, sanitize_to_json, to_str
+from shared.db_helpers import execute_upsert, execute_upsert_batch, sanitize_to_json, to_str
 from shared.interbanking_client import InterbankingClient
 
 logger = logging.getLogger(__name__)
@@ -459,36 +459,44 @@ class IBProcessor:
         b_dt, e_dt = _parse_dt(begin), _parse_dt(end)
         with self._sync_context(process, b_dt, e_dt) as counter:
             accounts_df, _ = self.client.get_cuentas()
-            with self.db.connect() as conn:
-                cur = conn.cursor()
-                for _, acc in accounts_df.iterrows():
-                    movements_df, _ = self.client.get_movimientos(
-                        account_number=str(acc["account_number"]),
-                        bank_number=acc["bank_number"],
-                        date_since=begin, date_until=end,
-                        movement_type="anteriores", version="v2",
+            # Acumulamos todos los movimientos en memoria y hacemos UN solo
+            # batch upsert al final. movements suele ser el sub-proceso mas
+            # voluminoso del ciclo; antes generaba N x M roundtrips
+            # (N cuentas x M movimientos por cuenta). Ahora: N llamadas IB +
+            # 3 sentencias SQL totales (clone, executemany, MERGE).
+            batch: List[Dict[str, Any]] = []
+            for _, acc in accounts_df.iterrows():
+                movements_df, _ = self.client.get_movimientos(
+                    account_number=str(acc["account_number"]),
+                    bank_number=acc["bank_number"],
+                    date_since=begin, date_until=end,
+                    movement_type="anteriores", version="v2",
+                )
+                counter["read"] += len(movements_df)
+                for _, row in movements_df.iterrows():
+                    r = self._normalize_row(row)
+                    r["movement_hash"] = _sha256(
+                        r.get("source_account"), r.get("voucher_number"), r.get("process_date"),
+                        r.get("amount"), r.get("debit_credit_type"), r.get("operation_code_ib"),
+                        r.get("branch_office_activity"), r.get("correlative_number"),
                     )
-                    counter["read"] += len(movements_df)
-                    for _, row in movements_df.iterrows():
-                        r = self._normalize_row(row)
-                        r["movement_hash"] = _sha256(
-                            r.get("source_account"), r.get("voucher_number"), r.get("process_date"),
-                            r.get("amount"), r.get("debit_credit_type"), r.get("operation_code_ib"),
-                            r.get("branch_office_activity"), r.get("correlative_number"),
-                        )
-                        r = self._row_with_account(r)
-                        r["process_date"] = _parse_dt(r.get("process_date"))
-                        r["real_date_activity"] = _parse_dt(r.get("real_date_activity"))
-                        r["movement_date"] = _parse_dt(r.get("movement_date"))
-                        r["value_date"] = _parse_dt(r.get("value_date"))
-                        r["raw_json"] = sanitize_to_json(r, source="ib")
-                        execute_upsert(
-                            cur, "finance.ib_movements",
-                            _IB_MOVEMENTS_KEYS, _IB_MOVEMENTS_UPDATE,
-                            r, extra_set=None,
-                        )
-                        counter["upserted"] += 1
-                conn.commit()
+                    r = self._row_with_account(r)
+                    r["process_date"] = _parse_dt(r.get("process_date"))
+                    r["real_date_activity"] = _parse_dt(r.get("real_date_activity"))
+                    r["movement_date"] = _parse_dt(r.get("movement_date"))
+                    r["value_date"] = _parse_dt(r.get("value_date"))
+                    r["raw_json"] = sanitize_to_json(r, source="ib")
+                    batch.append(r)
+
+            if batch:
+                with self.db.connect() as conn:
+                    cur = conn.cursor()
+                    counter["upserted"] = execute_upsert_batch(
+                        cur, "finance.ib_movements",
+                        _IB_MOVEMENTS_KEYS, _IB_MOVEMENTS_UPDATE,
+                        batch, extra_set=None,
+                    )
+                    conn.commit()
         return SyncStats(process, counter["read"], counter["upserted"],
                          int((_utcnow_naive() - started).total_seconds() * 1000))
 
@@ -558,40 +566,44 @@ class IBProcessor:
         b_dt, e_dt = _parse_dt(begin), _parse_dt(end)
         with self._sync_context(process, b_dt, e_dt) as counter:
             accounts_df, _ = self.client.get_cuentas()
-            with self.db.connect() as conn:
-                cur = conn.cursor()
-                for _, acc in accounts_df.iterrows():
-                    extracts_df, _ = self.client.get_extractos(
-                        account_number=str(acc["account_number"]),
-                        bank_number=acc["bank_number"],
-                        date_since=begin, date_until=end,
+            # Idem movements: bulk upsert al final.
+            batch: List[Dict[str, Any]] = []
+            for _, acc in accounts_df.iterrows():
+                extracts_df, _ = self.client.get_extractos(
+                    account_number=str(acc["account_number"]),
+                    bank_number=acc["bank_number"],
+                    date_since=begin, date_until=end,
+                )
+                counter["read"] += len(extracts_df)
+                for _, row in extracts_df.iterrows():
+                    r = self._normalize_row(row)
+                    r["extract_hash"] = _sha256(
+                        r.get("statement_number"), r.get("source_account"), r.get("voucher_number"),
+                        r.get("process_date"), r.get("amount"), r.get("debit_credit_type"),
+                        r.get("correlative_number"),
                     )
-                    counter["read"] += len(extracts_df)
-                    for _, row in extracts_df.iterrows():
-                        r = self._normalize_row(row)
-                        r["extract_hash"] = _sha256(
-                            r.get("statement_number"), r.get("source_account"), r.get("voucher_number"),
-                            r.get("process_date"), r.get("amount"), r.get("debit_credit_type"),
-                            r.get("correlative_number"),
-                        )
-                        r["statement_number"] = to_str(r.get("statement_number"))
-                        r["voucher_number"] = to_str(r.get("voucher_number"))
-                        r["branch_office_activity"] = to_str(r.get("branch_office_activity"))
-                        r["correlative_number"] = to_str(r.get("correlative_number"))
-                        r["source_account"] = to_str(r.get("source_account"))
-                        r["operation_date"] = _parse_dt(r.get("operation_date"))
-                        r["movement_date"] = _parse_dt(r.get("movement_date"))
-                        r["real_date_activity"] = _parse_dt(r.get("real_date_activity"))
-                        r["process_date"] = _parse_dt(r.get("process_date"))
-                        r["value_date"] = _parse_dt(r.get("value_date"))
-                        r["raw_json"] = sanitize_to_json(r, source="ib")
-                        execute_upsert(
-                            cur, "finance.ib_extracts",
-                            _IB_EXTRACTS_KEYS, _IB_EXTRACTS_UPDATE,
-                            r, extra_set=None,
-                        )
-                        counter["upserted"] += 1
-                conn.commit()
+                    r["statement_number"] = to_str(r.get("statement_number"))
+                    r["voucher_number"] = to_str(r.get("voucher_number"))
+                    r["branch_office_activity"] = to_str(r.get("branch_office_activity"))
+                    r["correlative_number"] = to_str(r.get("correlative_number"))
+                    r["source_account"] = to_str(r.get("source_account"))
+                    r["operation_date"] = _parse_dt(r.get("operation_date"))
+                    r["movement_date"] = _parse_dt(r.get("movement_date"))
+                    r["real_date_activity"] = _parse_dt(r.get("real_date_activity"))
+                    r["process_date"] = _parse_dt(r.get("process_date"))
+                    r["value_date"] = _parse_dt(r.get("value_date"))
+                    r["raw_json"] = sanitize_to_json(r, source="ib")
+                    batch.append(r)
+
+            if batch:
+                with self.db.connect() as conn:
+                    cur = conn.cursor()
+                    counter["upserted"] = execute_upsert_batch(
+                        cur, "finance.ib_extracts",
+                        _IB_EXTRACTS_KEYS, _IB_EXTRACTS_UPDATE,
+                        batch, extra_set=None,
+                    )
+                    conn.commit()
         return SyncStats(process, counter["read"], counter["upserted"],
                          int((_utcnow_naive() - started).total_seconds() * 1000))
 
