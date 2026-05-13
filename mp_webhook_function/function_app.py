@@ -32,7 +32,7 @@ from typing import Any, Dict, Optional, Tuple
 import azure.functions as func
 import pyodbc
 
-from shared.config import AppConfig, ConfigError
+from shared.config import ConfigError, MpWebhookConfig
 from shared.secret_string import SecretString
 
 from mp_client import MercadoPagoClient, MercadoPagoError
@@ -46,15 +46,15 @@ logger = logging.getLogger(__name__)
 # Se hace en module scope con caching para reusar entre invocaciones "warm".
 # =====================================================================
 
-_cached_config: Optional[AppConfig] = None
+_cached_config: Optional[MpWebhookConfig] = None
 _cached_mp_client: Optional[MercadoPagoClient] = None
 
 
-def _get_config() -> AppConfig:
+def _get_config() -> MpWebhookConfig:
     global _cached_config
     if _cached_config is None:
         try:
-            _cached_config = AppConfig.from_env()
+            _cached_config = MpWebhookConfig.from_env()
         except ConfigError as exc:
             logger.error("Config inválida al arrancar la Function: %s", exc)
             raise
@@ -175,15 +175,12 @@ def mp_webhook(req: func.HttpRequest) -> func.HttpResponse:
     event_type = body.get("type") or body.get("topic") or ""
 
     # 2. AZ-02 — HMAC validation.
+    # MpWebhookConfig.from_env() ya garantiza mp_webhook_secret presente,
+    # así que acá no hace falta re-chequearlo.
     try:
         config = _get_config()
     except ConfigError:
         return func.HttpResponse("config_error", status_code=500)
-
-    if config.mp_webhook_secret is None:
-        # Sin secret no podemos validar; por política rechazamos en vez de aceptar sin firma.
-        logger.error("[%s] MP_WEBHOOK_SECRET no configurado; rechazando webhook", invocation_id)
-        return func.HttpResponse("webhook_secret_not_configured", status_code=500)
 
     ok, reason = _verify_signature(
         secret=config.mp_webhook_secret,
