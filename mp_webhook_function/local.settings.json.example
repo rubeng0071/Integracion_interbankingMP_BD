@@ -14,6 +14,9 @@
     "MP_ACCESS_TOKEN": "APP_USR_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
     "MP_WEBHOOK_SECRET": "cambiar_cuando_se_active_el_webhook",
 
+    "_COMMENT_queue": "El handler HTTP encola payment_id; mp_process_payment lo procesa async. AzureWebJobsStorage debe apuntar a un account con tabla y queue. UseDevelopmentStorage=true usa Azurite local; en Azure usar DefaultEndpointsProtocol=... real.",
+    "MP_PAYMENT_QUEUE_NAME": "mp-payment-ids",
+
     "LOG_LEVEL": "INFO",
 
     "APPLICATIONINSIGHTS_CONNECTION_STRING": ""

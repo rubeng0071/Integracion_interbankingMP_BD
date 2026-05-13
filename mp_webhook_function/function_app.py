@@ -1,23 +1,30 @@
-"""Azure Function v2: webhook receiver para notificaciones de Mercado Pago.
+"""Azure Functions v2: receptor de webhooks de Mercado Pago + worker que persiste.
 
-Endpoint:
-    POST /api/mp/webhook
+Dos Functions en la misma app, conectadas por una Queue de Azure Storage:
 
-Flujo:
-    1. Parsear body (JSON).
-    2. AZ-02 — validar firma HMAC-SHA256 con el template oficial de MP:
-           manifest = "id:<data.id>;request-id:<x-request-id>;ts:<ts>;"
-           hmac    = HMAC_SHA256(secret, manifest)   ← comparar con v1
-       Si falla → 401, NO procesamos.
-    3. Si `type != "payment"` → 200 OK con ACK (ignoramos notificaciones de
-       otros recursos como merchant_order, subscription, etc.).
-    4. Hidratar el payment con GET /v1/payments/{id} (MP no envía el payload
-       completo en el webhook, solo el ID).
-    5. AZ-03 — idempotencia vía upsert_payment (verifica date_last_updated).
-    6. Commit transaccional y 200 OK.
+    POST /api/mp/webhook        →  mp_webhook (HTTP trigger)
+        - Valida HMAC + anti-replay (AZ-02).
+        - Filtra event_type != "payment".
+        - Encola el payment_id.
+        - Devuelve 202 Accepted en <200ms.
+
+    Queue "mp-payment-ids"      →  mp_process_payment (Queue trigger)
+        - Hidrata el payment con GET /v1/payments/{id}.
+        - UPSERT idempotente con AZ-03.
+        - Si falla, el runtime reintenta (default: 5 veces con backoff).
+
+Por qué separar:
+    El SLA del webhook MP es <2s. Antes el handler hacía HMAC + GET MP +
+    UPSERT SQL síncronamente; con MP API lenta (1.5s) y SQL (0.8s) ya nos
+    íbamos del SLA y MP marcaba caído. Encolar el ID toma <50ms y deja el
+    procesamiento a una Function dedicada con su propio retry/observabilidad.
+
+    Bonus: si MP API está caído, el webhook responde 202 igual; el mensaje
+    queda en la queue para reprocesar cuando MP se recupere.
 
 Referencias:
     Formato HMAC MP: https://www.mercadopago.com.ar/developers/es/docs/your-integrations/notifications/webhooks
+    Queue trigger v2: https://learn.microsoft.com/azure/azure-functions/functions-bindings-storage-queue-trigger
 """
 from __future__ import annotations
 
@@ -27,7 +34,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 import azure.functions as func
 import pyodbc
@@ -67,6 +74,13 @@ def _get_mp_client() -> MercadoPagoClient:
         cfg = _get_config()
         _cached_mp_client = MercadoPagoClient(cfg.mp_access_token)
     return _cached_mp_client
+
+
+# =====================================================================
+# Nombre de la queue (configurable). Default consistente con docs.
+# =====================================================================
+
+QUEUE_NAME = os.getenv("MP_PAYMENT_QUEUE_NAME", "mp-payment-ids")
 
 
 # =====================================================================
@@ -152,15 +166,24 @@ def _verify_signature(
 
 
 # =====================================================================
-# Azure Function v2 — HTTP trigger
+# Azure Functions v2 — Function App
 # =====================================================================
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 
 @app.route(route="mp/webhook", methods=["POST"])
-def mp_webhook(req: func.HttpRequest) -> func.HttpResponse:
-    """HTTP trigger que recibe notificaciones de Mercado Pago."""
+@app.queue_output(
+    arg_name="msg_out",
+    queue_name=QUEUE_NAME,
+    connection="AzureWebJobsStorage",
+)
+def mp_webhook(req: func.HttpRequest, msg_out: func.Out[str]) -> func.HttpResponse:
+    """HTTP trigger: valida HMAC y encola el payment_id.
+
+    Responde 202 en cuanto el mensaje se encolá. El upsert real lo hace
+    mp_process_payment desde la queue, sin contar contra el SLA del webhook.
+    """
     invocation_id = req.headers.get("x-ms-invocation-id", "unknown")
 
     # 1. Parsear body.
@@ -175,8 +198,6 @@ def mp_webhook(req: func.HttpRequest) -> func.HttpResponse:
     event_type = body.get("type") or body.get("topic") or ""
 
     # 2. AZ-02 — HMAC validation.
-    # MpWebhookConfig.from_env() ya garantiza mp_webhook_secret presente,
-    # así que acá no hace falta re-chequearlo.
     try:
         config = _get_config()
     except ConfigError:
@@ -195,21 +216,63 @@ def mp_webhook(req: func.HttpRequest) -> func.HttpResponse:
     # 3. Filtro por tipo.
     if event_type != "payment":
         logger.info("[%s] event_type=%s ignorado (solo procesamos 'payment')", invocation_id, event_type)
-        return func.HttpResponse(json.dumps({"status": "ignored", "type": event_type}),
-                                 status_code=200, mimetype="application/json")
+        return func.HttpResponse(
+            json.dumps({"status": "ignored", "type": event_type}),
+            status_code=200,
+            mimetype="application/json",
+        )
 
     if not data_id:
         return func.HttpResponse("missing_payment_id", status_code=400)
 
-    # 4. Hidratar payment desde la API MP.
-    try:
-        payment = _get_mp_client().get_payment(data_id)
-    except MercadoPagoError as exc:
-        logger.error("[%s] GET /v1/payments/%s falló: %s", invocation_id, data_id, exc)
-        # 502: es un error aguas arriba, no nuestro. MP hará retry.
-        return func.HttpResponse("upstream_error", status_code=502)
+    # 4. Encolar: el queue_output binding se materializa cuando set() devuelve.
+    # El mensaje es solo el payment_id; el worker lo hidrata via API.
+    msg_out.set(data_id)
+    logger.info("[%s] payment_id=%s encolado en %s", invocation_id, data_id, QUEUE_NAME)
 
-    # 5. AZ-03 — upsert idempotente.
+    return func.HttpResponse(
+        json.dumps({"status": "queued", "payment_id": data_id}),
+        status_code=202,
+        mimetype="application/json",
+    )
+
+
+@app.queue_trigger(
+    arg_name="msg",
+    queue_name=QUEUE_NAME,
+    connection="AzureWebJobsStorage",
+)
+def mp_process_payment(msg: func.QueueMessage) -> None:
+    """Queue trigger: hidrata el payment y hace el upsert.
+
+    El runtime de Functions garantiza at-least-once delivery con backoff
+    exponencial automático (default 5 intentos). Si el mensaje sigue
+    fallando, va a la queue de poison (<queue>-poison) para inspección
+    manual sin bloquear el resto del stream.
+
+    AZ-03: el upsert es idempotente; reintentos de un mismo payment_id
+    no duplican.
+    """
+    payment_id = msg.get_body().decode("utf-8").strip()
+    invocation_id = getattr(msg, "id", "unknown")
+
+    if not payment_id:
+        logger.warning("[%s] mensaje vacío en %s; descartando", invocation_id, QUEUE_NAME)
+        return
+
+    try:
+        config = _get_config()
+    except ConfigError:
+        logger.exception("[%s] config_error procesando payment_id=%s", invocation_id, payment_id)
+        raise
+
+    try:
+        payment = _get_mp_client().get_payment(payment_id)
+    except MercadoPagoError:
+        logger.exception("[%s] GET /v1/payments/%s falló", invocation_id, payment_id)
+        # Re-raise: el runtime hace retry con backoff y eventualmente a poison.
+        raise
+
     try:
         with pyodbc.connect(config.sql_connection_string.reveal(), autocommit=False) as conn:
             try:
@@ -218,22 +281,15 @@ def mp_webhook(req: func.HttpRequest) -> func.HttpResponse:
             except Exception:
                 conn.rollback()
                 raise
-    except pyodbc.Error as exc:
-        logger.exception("[%s] Error de DB procesando payment %s", invocation_id, data_id)
-        # 500: permite retry automático del runtime (host.json → retry policy).
-        return func.HttpResponse("db_error", status_code=500)
+    except pyodbc.Error:
+        logger.exception("[%s] Error de DB procesando payment %s", invocation_id, payment_id)
+        raise
 
     logger.info(
         "[%s] payment %s procesado: skipped=%s charges=%d items=%d",
-        invocation_id, result.payment_id, result.skipped_idempotent,
-        result.charges_upserted, result.items_upserted,
-    )
-    return func.HttpResponse(
-        json.dumps({
-            "status": "ok",
-            "payment_id": result.payment_id,
-            "skipped_idempotent": result.skipped_idempotent,
-        }),
-        status_code=200,
-        mimetype="application/json",
+        invocation_id,
+        result.payment_id,
+        result.skipped_idempotent,
+        result.charges_upserted,
+        result.items_upserted,
     )
