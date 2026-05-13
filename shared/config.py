@@ -194,3 +194,124 @@ class AppConfig:
             azure_key_vault_uri=os.getenv("AZURE_KEY_VAULT_URI"),
             application_insights_connection_string=v.optional_secret("APPLICATIONINSIGHTS_CONNECTION_STRING"),
         )
+
+
+# =====================================================================
+# Configs especializadas por componente.
+#
+# Cada Function valida solo lo que usa. Antes mp_webhook_function tenía
+# que setear IB_CLIENT_ID="unused_in_webhook" porque AppConfig exigía
+# todas las variables; ahora MpWebhookConfig solo pide MP_*+SQL_* y
+# IbPollerConfig solo pide IB_*+SQL_*. Las dos comparten _Validator
+# para mantener el patrón fail-fast con reporte agregado.
+# =====================================================================
+
+
+@dataclass
+class MpWebhookConfig:
+    """Configuración mínima para mp_webhook_function.
+
+    A diferencia de AppConfig, MP_WEBHOOK_SECRET es OBLIGATORIO: sin él
+    no podemos validar HMAC, y la política es rechazar webhooks sin firma.
+    Forzarlo en la config saca el check tardío del handler HTTP.
+    """
+
+    sql_connection_string: SecretString
+    mp_access_token: SecretString
+    mp_webhook_secret: SecretString
+    log_level: str = "INFO"
+    azure_key_vault_uri: Optional[str] = None
+    application_insights_connection_string: Optional[SecretString] = None
+
+    _errors: List[str] = field(default_factory=list, repr=False)
+
+    @classmethod
+    def from_env(cls, secrets: Optional[AzureSecretsClient] = None) -> "MpWebhookConfig":
+        v = _Validator(secrets or default_secrets_client())
+        sql = v.required_secret("SQL_CONNECTION_STRING")
+        mp_token = v.required_secret("MP_ACCESS_TOKEN")
+        webhook_secret = v.required_secret("MP_WEBHOOK_SECRET")
+        v.raise_if_errors()
+        return cls(
+            sql_connection_string=sql,                  # type: ignore[arg-type]
+            mp_access_token=mp_token,                   # type: ignore[arg-type]
+            mp_webhook_secret=webhook_secret,           # type: ignore[arg-type]
+            log_level=os.getenv("LOG_LEVEL", cls.log_level),
+            azure_key_vault_uri=os.getenv("AZURE_KEY_VAULT_URI"),
+            application_insights_connection_string=v.optional_secret(
+                "APPLICATIONINSIGHTS_CONNECTION_STRING"
+            ),
+        )
+
+
+@dataclass
+class IbPollerConfig:
+    """Configuración mínima para ib_poller. No requiere MP_*."""
+
+    sql_connection_string: SecretString
+    ib_client_id: SecretString
+    ib_client_secret: SecretString
+    ib_service_url: str
+    ib_customer_id: str
+    ib_grant_type: str = "client_credentials"
+    ib_username: Optional[SecretString] = None
+    ib_password: Optional[SecretString] = None
+    ib_token_url: str = "https://auth.interbanking.com.ar/cas/oidc/accessToken"
+    ib_api_base_url: str = "https://api-gw.interbanking.com.ar/api/prod/v1"
+    ib_scope: str = "info-financiera"
+    ib_page_size: int = 100
+    ib_timeout_seconds: int = 60
+    ib_incremental_lookback_days: int = 7
+    log_level: str = "INFO"
+    azure_key_vault_uri: Optional[str] = None
+    application_insights_connection_string: Optional[SecretString] = None
+
+    _errors: List[str] = field(default_factory=list, repr=False)
+
+    @classmethod
+    def from_env(cls, secrets: Optional[AzureSecretsClient] = None) -> "IbPollerConfig":
+        v = _Validator(secrets or default_secrets_client())
+
+        sql = v.required_secret("SQL_CONNECTION_STRING")
+        ib_id = v.required_secret("IB_CLIENT_ID")
+        ib_secret = v.required_secret("IB_CLIENT_SECRET")
+        ib_service_url = v.required_str("IB_SERVICE_URL")
+        ib_customer_id = v.required_str("IB_CUSTOMER_ID")
+
+        grant_type = os.getenv("IB_GRANT_TYPE", "client_credentials")
+        if grant_type == "password":
+            ib_username = v.required_secret("IB_USERNAME")
+            ib_password = v.required_secret("IB_PASSWORD")
+        else:
+            ib_username = v.optional_secret("IB_USERNAME")
+            ib_password = v.optional_secret("IB_PASSWORD")
+
+        ib_page_size = v.int_env("IB_PAGE_SIZE", cls.ib_page_size)
+        ib_timeout_seconds = v.int_env("IB_TIMEOUT_SECONDS", cls.ib_timeout_seconds)
+        ib_incremental_lookback_days = v.int_env(
+            "IB_INCREMENTAL_LOOKBACK_DAYS", cls.ib_incremental_lookback_days
+        )
+
+        v.raise_if_errors()
+
+        return cls(
+            sql_connection_string=sql,                  # type: ignore[arg-type]
+            ib_client_id=ib_id,                         # type: ignore[arg-type]
+            ib_client_secret=ib_secret,                 # type: ignore[arg-type]
+            ib_service_url=ib_service_url,              # type: ignore[arg-type]
+            ib_customer_id=ib_customer_id,              # type: ignore[arg-type]
+            ib_grant_type=grant_type,
+            ib_username=ib_username,
+            ib_password=ib_password,
+            ib_token_url=os.getenv("IB_TOKEN_URL", cls.ib_token_url),
+            ib_api_base_url=os.getenv("IB_API_BASE_URL", cls.ib_api_base_url).rstrip("/"),
+            ib_scope=os.getenv("IB_SCOPE", cls.ib_scope),
+            ib_page_size=ib_page_size,
+            ib_timeout_seconds=ib_timeout_seconds,
+            ib_incremental_lookback_days=ib_incremental_lookback_days,
+            log_level=os.getenv("LOG_LEVEL", cls.log_level),
+            azure_key_vault_uri=os.getenv("AZURE_KEY_VAULT_URI"),
+            application_insights_connection_string=v.optional_secret(
+                "APPLICATIONINSIGHTS_CONNECTION_STRING"
+            ),
+        )
