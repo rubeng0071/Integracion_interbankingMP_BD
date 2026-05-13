@@ -100,6 +100,111 @@ def build_merge_sql(
     )
 
 
+def execute_upsert_batch(
+    cur: Any,
+    table: str,
+    key_cols: Sequence[str],
+    update_cols: Sequence[str],
+    rows: Sequence[Dict[str, Any]],
+    extra_set: Optional[str] = "updated_at=SYSUTCDATETIME()",
+) -> int:
+    """UPSERT bulk vía staging table: 3 roundtrips para N filas.
+
+    Pensado para tablas con volumen alto por ciclo (movements, extracts).
+    Para una sola fila o lotes <10 conviene execute_upsert() individual:
+    el overhead del CREATE/DROP de la temp table no se amortiza.
+
+    Pasos:
+        1. Crear #stg_<table> clonando solo las columnas relevantes
+           (SELECT TOP 0 ... INTO ...). Copia los tipos pero ignora
+           constraints/identity de la tabla destino.
+        2. executemany() con fast_executemany=True para bulk insert al stg.
+        3. MERGE stg → destino en una sola sentencia, luego DROP del stg.
+
+    El stg vive en la sesión actual; con conexión persistente (refactor
+    A) y una llamada que falle en (2), el DROP queda pendiente. Por eso
+    usamos un nombre derivado de la tabla destino y lo recreamos en (1)
+    con DROP-IF-EXISTS implícito vía DROP TABLE en el finally.
+
+    Args:
+        cur: pyodbc.Cursor activo (transacción manejada por el caller).
+        table: Tabla destino calificada con schema (ej: "finance.ib_movements").
+        key_cols: PK natural para el ON del MERGE.
+        update_cols: Columnas a actualizar/insertar (sin contar key_cols).
+        rows: Lista de dicts con TODAS las columnas key_cols + update_cols.
+        extra_set: SQL extra para el SET (por default updated_at).
+
+    Returns:
+        Cantidad de filas procesadas (== len(rows)).
+
+    Raises:
+        KeyError: si algún row no tiene alguna columna esperada.
+        pyodbc.Error: se propaga; el caller decide rollback.
+    """
+    if not rows:
+        return 0
+
+    insert_cols = list(key_cols) + list(update_cols)
+    col_list = ", ".join(insert_cols)
+    placeholders = ", ".join(["?"] * len(insert_cols))
+
+    # Nombre de stg derivado de la tabla destino para evitar choques entre
+    # sub-procesos que compartan conexión (refactor A).
+    table_short = table.split(".")[-1]
+    stg = f"#stg_{table_short}"
+
+    try:
+        # Asegurar que no quede un stg residual de una corrida previa fallida.
+        cur.execute(
+            f"IF OBJECT_ID('tempdb..{stg}') IS NOT NULL DROP TABLE {stg};"
+        )
+        # 1. Clonar schema (solo las columnas que vamos a usar).
+        cur.execute(f"SELECT TOP 0 {col_list} INTO {stg} FROM {table};")
+
+        # 2. Bulk insert.
+        try:
+            params: List[Tuple[Any, ...]] = []
+            for r in rows:
+                params.append(tuple(r[c] for c in insert_cols))
+        except KeyError as exc:
+            raise KeyError(f"execute_upsert_batch({table}): falta {exc} en algun row") from exc
+
+        # fast_executemany acelera 10-100x el bulk insert vía pyodbc.
+        original_fast = getattr(cur, "fast_executemany", False)
+        cur.fast_executemany = True
+        try:
+            cur.executemany(
+                f"INSERT INTO {stg} ({col_list}) VALUES ({placeholders})",
+                params,
+            )
+        finally:
+            cur.fast_executemany = original_fast
+
+        # 3. MERGE stg → tabla destino.
+        on_clause = " AND ".join(f"tgt.{c} = src.{c}" for c in key_cols)
+        set_clause = ", ".join(f"{c}=src.{c}" for c in update_cols)
+        if extra_set:
+            set_clause += f", {extra_set}"
+        insert_values_clause = ", ".join(f"src.{c}" for c in insert_cols)
+        merge_sql = (
+            f"MERGE {table} AS tgt "
+            f"USING {stg} AS src "
+            f"ON {on_clause} "
+            f"WHEN MATCHED THEN UPDATE SET {set_clause} "
+            f"WHEN NOT MATCHED THEN INSERT ({col_list}) VALUES ({insert_values_clause});"
+        )
+        cur.execute(merge_sql)
+    finally:
+        # Limpiamos el stg aunque haya error; en una conexión persistente,
+        # el siguiente upsert puede chocar contra un stg residual.
+        try:
+            cur.execute(f"IF OBJECT_ID('tempdb..{stg}') IS NOT NULL DROP TABLE {stg};")
+        except Exception:  # pragma: no cover  defensivo
+            pass
+
+    return len(rows)
+
+
 def execute_upsert(
     cur: Any,
     table: str,

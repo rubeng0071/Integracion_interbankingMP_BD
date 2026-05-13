@@ -11,6 +11,7 @@ from shared.db_helpers import (
     build_merge_sql,
     ensure_keys,
     execute_upsert,
+    execute_upsert_batch,
     sanitize_for_storage,
     sanitize_to_json,
     to_str,
@@ -166,6 +167,113 @@ class TestExecuteUpsert:
         )
         sql = cur.execute.call_args.args[0]
         assert "updated_at=SYSUTCDATETIME()" in sql
+
+
+# =====================================================================
+# execute_upsert_batch  (CAL-02)
+# =====================================================================
+
+
+class TestExecuteUpsertBatch:
+    def test_filas_vacias_no_ejecuta_nada(self) -> None:
+        cur = MagicMock()
+        n = execute_upsert_batch(
+            cur,
+            table="finance.t",
+            key_cols=("id",),
+            update_cols=("name",),
+            rows=[],
+        )
+        assert n == 0
+        cur.execute.assert_not_called()
+
+    def test_secuencia_de_sentencias(self) -> None:
+        """3 SQLs en orden: pre-drop, SELECT TOP 0 INTO, MERGE, post-drop."""
+        cur = MagicMock()
+        rows = [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]
+        n = execute_upsert_batch(
+            cur,
+            table="finance.t",
+            key_cols=("id",),
+            update_cols=("name",),
+            rows=rows,
+        )
+        assert n == 2
+
+        # Capturamos todos los SQLs (execute + executemany).
+        execute_calls = [c.args[0] for c in cur.execute.call_args_list]
+        # Pre-drop defensivo, clonado de schema, MERGE y post-drop deben aparecer.
+        assert any("DROP TABLE" in s for s in execute_calls[:1]), "falta pre-drop defensivo"
+        assert any("SELECT TOP 0" in s for s in execute_calls), "falta clonado de schema"
+        assert any("MERGE finance.t" in s for s in execute_calls), "falta MERGE"
+        assert any("DROP TABLE" in s for s in execute_calls[-1:]), "falta post-drop"
+
+        # Bulk insert via executemany.
+        cur.executemany.assert_called_once()
+        insert_sql = cur.executemany.call_args.args[0]
+        params = cur.executemany.call_args.args[1]
+        assert "INSERT INTO #stg_t" in insert_sql
+        # Orden de columnas: keys + update_cols.
+        assert params == [(1, "a"), (2, "b")]
+
+    def test_fast_executemany_se_activa_y_se_restaura(self) -> None:
+        cur = MagicMock()
+        cur.fast_executemany = False  # estado previo
+        execute_upsert_batch(
+            cur,
+            table="finance.t",
+            key_cols=("id",),
+            update_cols=("name",),
+            rows=[{"id": 1, "name": "a"}],
+        )
+        # Tras la operación, el flag vuelve a su valor original.
+        assert cur.fast_executemany is False
+
+    def test_keyerror_cita_la_tabla(self) -> None:
+        cur = MagicMock()
+        with pytest.raises(KeyError, match="finance.t"):
+            execute_upsert_batch(
+                cur,
+                table="finance.t",
+                key_cols=("id",),
+                update_cols=("name",),
+                rows=[{"id": 1}],  # falta 'name'
+            )
+
+    def test_merge_incluye_extra_set_default(self) -> None:
+        cur = MagicMock()
+        execute_upsert_batch(
+            cur,
+            table="finance.t",
+            key_cols=("id",),
+            update_cols=("name",),
+            rows=[{"id": 1, "name": "a"}],
+        )
+        merge_sql = next(
+            c.args[0] for c in cur.execute.call_args_list if "MERGE" in c.args[0]
+        )
+        assert "updated_at=SYSUTCDATETIME()" in merge_sql
+
+    def test_stg_name_por_tabla_short(self) -> None:
+        """Tablas distintas deben usar stg distintos (para no chocarse)."""
+        cur = MagicMock()
+        execute_upsert_batch(
+            cur,
+            table="finance.ib_movements",
+            key_cols=("movement_hash",),
+            update_cols=("amount",),
+            rows=[{"movement_hash": "h", "amount": 1}],
+        )
+        execute_upsert_batch(
+            cur,
+            table="finance.ib_extracts",
+            key_cols=("extract_hash",),
+            update_cols=("amount",),
+            rows=[{"extract_hash": "h", "amount": 2}],
+        )
+        all_sql = [c.args[0] for c in cur.execute.call_args_list]
+        assert any("#stg_ib_movements" in s for s in all_sql)
+        assert any("#stg_ib_extracts" in s for s in all_sql)
 
 
 # =====================================================================
