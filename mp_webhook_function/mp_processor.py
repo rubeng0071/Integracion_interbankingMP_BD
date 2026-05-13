@@ -197,11 +197,16 @@ class UpsertResult:
 
 
 def _is_already_current(cur: pyodbc.Cursor, payment_id: Any, date_last_updated: Optional[datetime]) -> bool:
-    """AZ-03 — idempotencia: si ya existe con el mismo date_last_updated, skip.
+    """AZ-03 — idempotencia: skip solo si ya tenemos EXACTAMENTE este date_last_updated.
 
-    MP puede reenviar el mismo webhook varias veces (at-least-once delivery).
-    El MERGE en SQL ya lo hace seguro, pero verificar antes evita queries
-    innecesarias de UPDATE y reduce contention en la tabla.
+    Antes usaba `>=`, que skipea cuando lo almacenado es más nuevo que lo entrante.
+    Eso es peligroso ante delivery fuera de orden: si llega un webhook con un
+    cambio legítimo en otros campos pero su date_last_updated quedó ligeramente
+    por debajo del que ya guardamos, perdemos la actualización.
+
+    `==` es más conservador: cualquier diferencia dispara el MERGE. El MERGE en
+    SQL es idempotente y barato si no hay cambios reales; la red de seguridad
+    contra duplicados queda en la DB.
     """
     if date_last_updated is None:
         return False
@@ -217,7 +222,7 @@ def _is_already_current(cur: pyodbc.Cursor, payment_id: Any, date_last_updated: 
         return False
     existing = row[0]
     if isinstance(existing, datetime):
-        return existing.replace(tzinfo=None) >= date_last_updated
+        return existing.replace(tzinfo=None) == date_last_updated
     return False
 
 
