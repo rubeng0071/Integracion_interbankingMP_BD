@@ -540,7 +540,7 @@ class IBProcessor:
             ("balances",      lambda: self._process_balances(*self._window("interbanking_balances"))),
             ("movements",     lambda: self._process_movements(*self._window("interbanking_movements"))),
             ("transfers",     lambda: self._process_transfers(*self._window("interbanking_transfers"))),
-            ("vouchers",      lambda: self._process_vouchers(*self._window("interbanking_transfers"))),
+            ("vouchers",      lambda: self._process_vouchers(*self._window("interbanking_vouchers"))),
             ("extracts",      lambda: self._process_extracts(*self._window("interbanking_extracts"))),
         ]
 
