@@ -52,3 +52,11 @@ packages = ["shared"]
 
 [tool.setuptools.package-data]
 shared = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q --strict-markers"
+filterwarnings = [
+    "ignore::DeprecationWarning:dateutil.*",
+]
