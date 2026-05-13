@@ -87,16 +87,72 @@ def _sha256(*parts: Any) -> str:
 # =====================================================================
 
 class Database:
+    """Wrapper de pyodbc con conexión persistente durante el ciclo del poller.
+
+    Antes cada operación (`get_last_successful_sync`, `update_sync_control`,
+    `start_sync_run`, `finish_sync_run` y los `with db.connect()` de los
+    sub-procesos) abría y cerraba una conexión propia. En un ciclo completo
+    eso significaba ~30 conexiones a Azure SQL, lo que en serverless cuesta
+    DTU y agrega latencia de handshake en cada operación.
+
+    Ahora mantenemos UNA sola conexión durante todo el run_full_sync():
+        - Si todavía no hay conexión abierta, la creamos al primer uso.
+        - Si la última operación lanzó excepción, hacemos rollback antes de
+          ceder la conexión otra vez (evita "current transaction is aborted"
+          residual en la próxima query).
+        - Si la conexión se murió (idle timeout de Azure SQL, network blip),
+          la siguiente operación detecta el error y reabre.
+
+    Cerramos explícitamente al final del ciclo (close()) para no dejar
+    sockets colgados entre invocaciones warm de la Function.
+    """
+
     def __init__(self, conn_str: str) -> None:
         self.conn_str = conn_str
+        self._conn: Optional[pyodbc.Connection] = None
+
+    def _open(self) -> pyodbc.Connection:
+        return pyodbc.connect(self.conn_str, autocommit=False)
+
+    def _ensure_alive(self) -> pyodbc.Connection:
+        if self._conn is None:
+            self._conn = self._open()
+            return self._conn
+        try:
+            # Ping liviano para detectar conexiones zombi (idle timeout, etc.).
+            self._conn.cursor().execute("SELECT 1").fetchone()
+            return self._conn
+        except pyodbc.Error:
+            logger.warning("Conexión SQL muerta; reabriendo")
+            try:
+                self._conn.close()
+            except pyodbc.Error:
+                pass
+            self._conn = self._open()
+            return self._conn
 
     @contextmanager
     def connect(self) -> Iterator[pyodbc.Connection]:
-        conn = pyodbc.connect(self.conn_str, autocommit=False)
+        conn = self._ensure_alive()
         try:
             yield conn
-        finally:
-            conn.close()
+        except Exception:
+            # Rollback defensivo: si el caller no commiteó por una excepción,
+            # la próxima query empezaría con la transacción abortada.
+            try:
+                conn.rollback()
+            except pyodbc.Error:
+                pass
+            raise
+
+    def close(self) -> None:
+        if self._conn is None:
+            return
+        try:
+            self._conn.close()
+        except pyodbc.Error:
+            pass
+        self._conn = None
 
     def get_last_successful_sync(self, process_name: str) -> Optional[datetime]:
         with self.connect() as conn:
@@ -549,6 +605,10 @@ class IBProcessor:
         No re-levanta excepciones de sub-procesos individuales: cada uno ya las
         loggea y persiste en finance.sync_runs / sync_control. Los errores
         parciales no impiden que los demás corran.
+
+        Al terminar cerramos la conexión SQL persistente; entre invocaciones
+        warm de la Function abrimos una nueva (es barato si el worker está
+        caliente, y evita arrastrar conexiones zombi por horas).
         """
         results: Dict[str, SyncStats] = {}
 
@@ -561,13 +621,16 @@ class IBProcessor:
             ("extracts",      lambda: self._process_extracts(*self._window("interbanking_extracts"))),
         ]
 
-        for label, fn in steps:
-            try:
-                results[label] = fn()
-            except Exception as exc:
-                logger.error("Sub-proceso '%s' falló: %s; continuando con los demás", label, exc)
-                results[label] = SyncStats(label, 0, 0, 0)
-        return results
+        try:
+            for label, fn in steps:
+                try:
+                    results[label] = fn()
+                except Exception as exc:
+                    logger.error("Sub-proceso '%s' falló: %s; continuando con los demás", label, exc)
+                    results[label] = SyncStats(label, 0, 0, 0)
+            return results
+        finally:
+            self.db.close()
 
 
 def run_full_sync(config: IbPollerConfig) -> Dict[str, SyncStats]:
