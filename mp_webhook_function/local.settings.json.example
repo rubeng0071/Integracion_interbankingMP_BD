@@ -14,12 +14,6 @@
     "MP_ACCESS_TOKEN": "APP_USR_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
     "MP_WEBHOOK_SECRET": "cambiar_cuando_se_active_el_webhook",
 
-    "_COMMENT_3": "Estas vars son requeridas por AppConfig pero no las usa esta Function (son del poller IB).",
-    "IB_CLIENT_ID": "unused_in_webhook",
-    "IB_CLIENT_SECRET": "unused_in_webhook",
-    "IB_SERVICE_URL": "https://example.com/callback",
-    "IB_CUSTOMER_ID": "0",
-
     "LOG_LEVEL": "INFO",
 
     "APPLICATIONINSIGHTS_CONNECTION_STRING": ""

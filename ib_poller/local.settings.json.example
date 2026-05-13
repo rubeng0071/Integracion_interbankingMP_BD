@@ -11,9 +11,6 @@
 
     "SQL_CONNECTION_STRING": "DRIVER={ODBC Driver 18 for SQL Server};SERVER=tu-servidor.database.windows.net;DATABASE=finance;UID=finance_svc;PWD=cambiar;Encrypt=yes;TrustServerCertificate=no;",
 
-    "_COMMENT_mp": "La Function IB no usa MP; pero AppConfig.from_env() lo exige. Placeholder dummy.",
-    "MP_ACCESS_TOKEN": "unused_in_ib_poller",
-
     "IB_CLIENT_ID": "tu_client_id",
     "IB_CLIENT_SECRET": "tu_client_secret",
     "IB_SERVICE_URL": "https://tu-empresa.com.ar/callback",
