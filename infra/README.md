@@ -11,15 +11,18 @@ Key Vault, Storage, SQL Server + DB y las dos Function Apps.
 ## Orden de ejecución (primera vez)
 
 ```powershell
-.\00-prereqs.ps1                # Valida az login, versión, providers.
-.\10-create-foundation.ps1      # RG + Log Analytics + AppInsights + KV + Storage.
-.\20-create-sql.ps1             # SQL Server + DB + firewall + admin AAD.
-.\30-create-function-mp.ps1     # Function App MP webhook + MI + App Settings.
-.\40-create-function-ib.ps1     # Function App IB poller + MI + App Settings.
-.\50-load-secrets.ps1           # Cargá .env → Key Vault y RBAC a las MIs.
-.\70-create-queue.ps1           # Crea la queue mp-payment-ids del refactor J.
-.\60-deploy-code.ps1            # Build del wheel y `func azure functionapp publish`.
+.\00-prereqs.ps1                          # Valida az login, versión, providers.
+.\10-create-foundation.ps1                # RG + Log Analytics + AppInsights + KV + Storage.
+.\20-create-sql.ps1                       # SQL Server + DB + firewall + admin AAD.
+.\30-create-function-mp.ps1               # Function App MP webhook + MI + App Settings.
+.\40-create-function-ib.ps1               # Function App IB poller + MI + App Settings.
+.\50-load-secrets.ps1                     # Cargá .env → Key Vault y RBAC a las MIs.
+.\70-create-queue.ps1                     # Crea la queue mp-payment-ids del refactor J.
+.\60-deploy-code.ps1                      # Build del wheel y `func azure functionapp publish`.
+.\80-create-alerts.ps1 -NotifyEmail you@x # Action Group + 4 alertas de Monitor.
 ```
+
+Queries KQL para inspección: ver [`docs/OBSERVABILITY.md`](../docs/OBSERVABILITY.md).
 
 Tiempo estimado primera vez: 15-25 min. Reaplicaciones: <2 min porque las
 operaciones ya hechas se saltan.
