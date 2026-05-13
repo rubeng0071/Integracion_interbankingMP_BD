@@ -23,7 +23,7 @@ import pandas as pd
 import pyodbc
 from dateutil import parser as dtparser
 
-from shared.config import AppConfig
+from shared.config import IbPollerConfig
 from shared.db_helpers import execute_upsert, sanitize_to_json, to_str
 from shared.interbanking_client import InterbankingClient
 
@@ -268,7 +268,7 @@ class IBProcessor:
         en constantes al tope del archivo.
     """
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: IbPollerConfig) -> None:
         self.config = config
         self.db = Database(config.sql_connection_string.reveal())
         self.client = InterbankingClient()
@@ -553,6 +553,6 @@ class IBProcessor:
         return results
 
 
-def run_full_sync(config: AppConfig) -> Dict[str, SyncStats]:
+def run_full_sync(config: IbPollerConfig) -> Dict[str, SyncStats]:
     """Atajo functional para llamar desde function_app.py."""
     return IBProcessor(config).run_full_sync()
