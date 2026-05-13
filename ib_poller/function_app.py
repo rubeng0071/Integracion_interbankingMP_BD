@@ -28,6 +28,7 @@ from typing import Optional
 import azure.functions as func
 
 from shared.config import ConfigError, IbPollerConfig
+from shared.observability import configure_logging
 
 from ib_processor import IBProcessor
 
@@ -35,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 
 # =====================================================================
-# Cache de config entre invocaciones warm
+# Cache de config + bootstrap de observability entre invocaciones warm
 # =====================================================================
 
 _cached_config: Optional[IbPollerConfig] = None
@@ -49,6 +50,11 @@ def _get_config() -> IbPollerConfig:
         except ConfigError as exc:
             logger.error("Config inválida al arrancar el poller: %s", exc)
             raise
+        configure_logging(
+            connection_string=_cached_config.application_insights_connection_string,
+            level=_cached_config.log_level,
+            service_name="ib_poller",
+        )
     return _cached_config
 
 

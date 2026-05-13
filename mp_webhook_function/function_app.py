@@ -40,6 +40,7 @@ import azure.functions as func
 import pyodbc
 
 from shared.config import ConfigError, MpWebhookConfig
+from shared.observability import configure_logging
 from shared.secret_string import SecretString
 
 from mp_client import MercadoPagoClient, MercadoPagoError
@@ -49,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 
 # =====================================================================
-# Inicialización perezosa de la config.
+# Inicialización perezosa de la config + observability.
 # Se hace en module scope con caching para reusar entre invocaciones "warm".
 # =====================================================================
 
@@ -65,6 +66,14 @@ def _get_config() -> MpWebhookConfig:
         except ConfigError as exc:
             logger.error("Config inválida al arrancar la Function: %s", exc)
             raise
+        # Bootstrap del logging estructurado + AppInsights ni bien tenemos
+        # la conn string. configure_logging es idempotente, así que las
+        # invocaciones warm no la reinicializan.
+        configure_logging(
+            connection_string=_cached_config.application_insights_connection_string,
+            level=_cached_config.log_level,
+            service_name="mp_webhook",
+        )
     return _cached_config
 
 
