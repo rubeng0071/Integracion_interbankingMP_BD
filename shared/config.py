@@ -27,6 +27,62 @@ class ConfigError(RuntimeError):
     """Configuración inválida o incompleta. Mensaje incluye todos los errores."""
 
 
+# =====================================================================
+# Helper interno: validador agregado.
+#
+# Centraliza la lectura de secretos/env vars + la acumulación de errores
+# para que MULTIPLES dataclasses de configuración compartan el patrón
+# fail-fast con reporte único. Antes vivía como closures dentro de
+# AppConfig.from_env(); al externalizarlo, MpWebhookConfig e IbPollerConfig
+# pueden reusarlo sin duplicar lógica.
+# =====================================================================
+
+
+class _Validator:
+    """Acumula errores durante la construcción de una config y los reporta al final."""
+
+    def __init__(self, secrets: AzureSecretsClient) -> None:
+        self.secrets = secrets
+        self.errors: List[str] = []
+
+    def required_secret(self, name: str) -> Optional[SecretString]:
+        try:
+            return self.secrets.get(name)
+        except SecretNotFoundError:
+            self.errors.append(f"  - {name} (requerido, no encontrado en Key Vault ni en env)")
+            return None
+
+    def optional_secret(self, name: str) -> Optional[SecretString]:
+        return self.secrets.get_optional(name)
+
+    def required_str(self, name: str) -> Optional[str]:
+        value = os.getenv(name)
+        if not value:
+            self.errors.append(f"  - {name} (variable de entorno requerida, vacía o ausente)")
+            return None
+        return value
+
+    def int_env(self, name: str, default: int) -> int:
+        raw = os.getenv(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            self.errors.append(f"  - {name} debe ser entero, recibido: '{raw}'")
+            return default
+
+    def raise_if_errors(self) -> None:
+        if not self.errors:
+            return
+        header = "Configuración inválida. Variables faltantes o erróneas:\n"
+        tip = (
+            "\n\nRevisá unified_finance_sync.env.example para ver el formato esperado, "
+            "o configurá Azure Key Vault con AZURE_KEY_VAULT_URI."
+        )
+        raise ConfigError(header + "\n".join(self.errors) + tip)
+
+
 @dataclass
 class AppConfig:
     """Configuración completa de la aplicación.
@@ -73,90 +129,52 @@ class AppConfig:
     def from_env(cls, secrets: Optional[AzureSecretsClient] = None) -> "AppConfig":
         """Construye la config validando TODO antes de devolver. Falla con un único error.
 
+        Pensado para el monolítico legacy y para tests que necesitan la config
+        completa. Para Functions individuales preferí MpWebhookConfig o
+        IbPollerConfig, que validan solo lo que cada componente realmente usa.
+
         Args:
             secrets: Cliente de secretos. Si None, usa el singleton global.
 
         Raises:
             ConfigError: si falta cualquier variable requerida (con lista completa).
         """
-        secrets = secrets or default_secrets_client()
-        errors: List[str] = []
+        v = _Validator(secrets or default_secrets_client())
 
-        def _required_secret(name: str) -> Optional[SecretString]:
-            try:
-                return secrets.get(name)
-            except SecretNotFoundError:
-                errors.append(f"  - {name} (requerido, no encontrado en Key Vault ni en env)")
-                return None
+        sql_conn = v.required_secret("SQL_CONNECTION_STRING")
+        mp_token = v.required_secret("MP_ACCESS_TOKEN")
+        ib_id = v.required_secret("IB_CLIENT_ID")
+        ib_secret = v.required_secret("IB_CLIENT_SECRET")
+        ib_service_url = v.required_str("IB_SERVICE_URL")
+        ib_customer_id = v.required_str("IB_CUSTOMER_ID")
 
-        def _optional_secret(name: str) -> Optional[SecretString]:
-            return secrets.get_optional(name)
-
-        def _required_str(name: str) -> Optional[str]:
-            value = os.getenv(name)
-            if not value:
-                errors.append(f"  - {name} (variable de entorno requerida, vacía o ausente)")
-                return None
-            return value
-
-        def _int_env(name: str, default: int) -> int:
-            raw = os.getenv(name)
-            if raw is None or raw == "":
-                return default
-            try:
-                return int(raw)
-            except ValueError:
-                errors.append(f"  - {name} debe ser entero, recibido: '{raw}'")
-                return default
-
-        sql_conn = _required_secret("SQL_CONNECTION_STRING")
-        mp_token = _required_secret("MP_ACCESS_TOKEN")
-        ib_id = _required_secret("IB_CLIENT_ID")
-        ib_secret = _required_secret("IB_CLIENT_SECRET")
-        ib_service_url = _required_str("IB_SERVICE_URL")
-        ib_customer_id = _required_str("IB_CUSTOMER_ID")
-
-        # Validación condicional: si grant_type=password, username/password son obligatorios.
         grant_type = os.getenv("IB_GRANT_TYPE", "client_credentials")
-        ib_username: Optional[SecretString] = None
-        ib_password: Optional[SecretString] = None
         if grant_type == "password":
-            ib_username = _required_secret("IB_USERNAME")
-            ib_password = _required_secret("IB_PASSWORD")
+            ib_username = v.required_secret("IB_USERNAME")
+            ib_password = v.required_secret("IB_PASSWORD")
         else:
-            ib_username = _optional_secret("IB_USERNAME")
-            ib_password = _optional_secret("IB_PASSWORD")
+            ib_username = v.optional_secret("IB_USERNAME")
+            ib_password = v.optional_secret("IB_PASSWORD")
 
-        # Parseo de enteros ANTES del check de errores: _int_env appendea a
-        # `errors` cuando el valor no es entero, así que tienen que evaluarse
-        # antes de la condición que dispara ConfigError. (Antes vivían dentro
-        # del `return cls(...)`, lo que dejaba los errores silenciosamente
-        # descartados y la config caía al default sin avisar.)
-        ib_page_size = _int_env("IB_PAGE_SIZE", cls.ib_page_size)
-        ib_timeout_seconds = _int_env("IB_TIMEOUT_SECONDS", cls.ib_timeout_seconds)
-        poll_interval_seconds = _int_env("POLL_INTERVAL_SECONDS", cls.poll_interval_seconds)
-        mp_initial_lookback_days = _int_env("MP_INITIAL_LOOKBACK_DAYS", cls.mp_initial_lookback_days)
-        mp_incremental_lookback_hours = _int_env(
+        ib_page_size = v.int_env("IB_PAGE_SIZE", cls.ib_page_size)
+        ib_timeout_seconds = v.int_env("IB_TIMEOUT_SECONDS", cls.ib_timeout_seconds)
+        poll_interval_seconds = v.int_env("POLL_INTERVAL_SECONDS", cls.poll_interval_seconds)
+        mp_initial_lookback_days = v.int_env("MP_INITIAL_LOOKBACK_DAYS", cls.mp_initial_lookback_days)
+        mp_incremental_lookback_hours = v.int_env(
             "MP_INCREMENTAL_LOOKBACK_HOURS", cls.mp_incremental_lookback_hours
         )
-        ib_incremental_lookback_days = _int_env(
+        ib_incremental_lookback_days = v.int_env(
             "IB_INCREMENTAL_LOOKBACK_DAYS", cls.ib_incremental_lookback_days
         )
 
-        if errors:
-            header = "Configuración inválida. Variables faltantes o erróneas:\n"
-            tip = (
-                "\n\nRevisá unified_finance_sync.env.example para ver el formato esperado, "
-                "o configurá Azure Key Vault con AZURE_KEY_VAULT_URI."
-            )
-            raise ConfigError(header + "\n".join(errors) + tip)
+        v.raise_if_errors()
 
         return cls(
             sql_connection_string=sql_conn,            # type: ignore[arg-type]  validado arriba
             mp_access_token=mp_token,                  # type: ignore[arg-type]
             ib_client_id=ib_id,                        # type: ignore[arg-type]
             ib_client_secret=ib_secret,                # type: ignore[arg-type]
-            mp_webhook_secret=_optional_secret("MP_WEBHOOK_SECRET"),
+            mp_webhook_secret=v.optional_secret("MP_WEBHOOK_SECRET"),
             ib_username=ib_username,
             ib_password=ib_password,
             ib_service_url=ib_service_url,             # type: ignore[arg-type]
@@ -174,5 +192,5 @@ class AppConfig:
             log_level=os.getenv("LOG_LEVEL", cls.log_level),
             output_dir=os.getenv("OUTPUT_DIR", cls.output_dir),
             azure_key_vault_uri=os.getenv("AZURE_KEY_VAULT_URI"),
-            application_insights_connection_string=_optional_secret("APPLICATIONINSIGHTS_CONNECTION_STRING"),
+            application_insights_connection_string=v.optional_secret("APPLICATIONINSIGHTS_CONNECTION_STRING"),
         )
