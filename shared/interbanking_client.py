@@ -38,7 +38,6 @@ import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -61,11 +60,40 @@ _DEFAULT_SCOPE     = "info-financiera"
 
 
 # ---------------------------------------------------------------------------
+# Lazy import de pandas
+#
+# pandas pesa ~250ms al importarse en cold start de Azure Functions Python.
+# La mayor parte del cliente NO lo necesita: solo `_to_df()` (último paso
+# de cada getter) y `export_to_excel()` (utility CLI). Mientras nadie llame
+# a esos métodos, pandas no se carga en el proceso.
+#
+# `from __future__ import annotations` hace que los type hints como
+# `pd.DataFrame` queden como strings y no fuercen el import. Por eso
+# podemos seguir anotando `Tuple[pd.DataFrame, Any]` sin penalty.
+#
+# Para que el futuro lector entienda el patrón: usar `_pd()` adentro del
+# código de runtime, NO importar pandas al top del módulo.
+# ---------------------------------------------------------------------------
+
+_pd_module = None  # cache de la primera importación
+
+
+def _pd():
+    """Devuelve el módulo pandas, importándolo en el primer uso."""
+    global _pd_module
+    if _pd_module is None:
+        import pandas as _pd_mod  # noqa: WPS433  lazy intencional
+        _pd_module = _pd_mod
+    return _pd_module
+
+
+# ---------------------------------------------------------------------------
 # Helpers de normalización de DataFrames
 # ---------------------------------------------------------------------------
 
-def _to_df(records: List[Dict[str, Any]], columns: List[str]) -> pd.DataFrame:
+def _to_df(records: List[Dict[str, Any]], columns: List[str]) -> "pd.DataFrame":  # noqa: F821
     """Crea un DataFrame con columnas fijas. Las columnas faltantes quedan en NaN."""
+    pd = _pd()
     if not records:
         return pd.DataFrame(columns=columns)
     df = pd.DataFrame(records)
@@ -953,8 +981,10 @@ class InterbankingClient:
                 date_since=date_since, date_until=date_until
             )
 
+            pd = _pd()  # export_to_excel necesita pandas; lo cargamos acá.
+
             print("📈 Obteniendo movimientos por cuenta...")
-            todos_movimientos: List[pd.DataFrame] = []
+            todos_movimientos: List["pd.DataFrame"] = []  # noqa: F821
             for _, cuenta in cuentas_df.iterrows():
                 try:
                     mov_df, _ = self.get_movimientos(
@@ -972,7 +1002,7 @@ class InterbankingClient:
             movimientos_df = pd.concat(todos_movimientos, ignore_index=True) if todos_movimientos else pd.DataFrame(columns=_MOVEMENTS_COLS)
 
             print("📋 Obteniendo extractos por cuenta...")
-            todos_extractos: List[pd.DataFrame] = []
+            todos_extractos: List["pd.DataFrame"] = []  # noqa: F821
             for _, cuenta in cuentas_df.iterrows():
                 try:
                     ext_df, _ = self.get_extractos(

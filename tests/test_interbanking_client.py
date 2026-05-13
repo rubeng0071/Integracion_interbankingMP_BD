@@ -85,6 +85,35 @@ class TestConstructor:
 # ---------------------------------------------------------------------------
 
 
+class TestLazyPandasImport:
+    """Verifica que pandas no se cargue al importar el cliente.
+
+    El test se hace en un subproceso para no contaminar sys.modules: si pytest
+    o un test previo ya importaron pandas (por ejemplo TestPandasInDataFrame),
+    el assert in-process daría falso positivo.
+    """
+
+    def test_modulo_no_carga_pandas_al_importarse(self) -> None:
+        import subprocess
+        import sys
+
+        script = (
+            "import sys; "
+            "assert 'pandas' not in sys.modules; "
+            "from shared.interbanking_client import InterbankingClient; "
+            "assert 'pandas' not in sys.modules, 'pandas se cargo al importar el cliente'; "
+            "print('ok')"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        assert "ok" in result.stdout
+
+
 class TestFromEnv:
     def test_construye_desde_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("IB_CLIENT_ID", "envcid")
