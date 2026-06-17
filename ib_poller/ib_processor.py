@@ -12,12 +12,11 @@ El entrypoint público es `run_full_sync(config)`, llamado desde function_app.py
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import pandas as pd
 import pyodbc
@@ -257,7 +256,8 @@ _IB_MOVEMENTS_UPDATE = (
     "amount", "voucher_number", "grouping_code_ib", "branch_office_activity",
     "process_date", "debit_credit_type", "movement_type", "source_account",
     "associated_voucher", "real_date_activity", "movement_date", "value_date",
-    "correlative_number", "raw_json",
+    "correlative_number", "grouping_code_standard", "code_description_standard",
+    "operation_code_standard", "movement_source", "raw_json",
 )
 
 _IB_TRANSFERS_KEYS = ("transfer_id",)
@@ -271,7 +271,12 @@ _IB_TRANSFERS_UPDATE = (
     "credit_account_bank_name", "credit_account_account_label",
     "debit_account_customer_cuit", "debit_account_account_cbu", "debit_account_account_number",
     "debit_account_currency", "debit_account_account_type", "debit_account_bank_number",
-    "debit_account_bank_name", "debit_account_account_label", "raw_json",
+    "debit_account_bank_name", "debit_account_account_label",
+    "addenda_operation_numer", "addenda_payment_receipt", "addenda_amount",
+    "addenda_seller_tax_id", "addenda_voucher_type", "addenda_seller_name",
+    "addenda_community_code", "addenda_seller_code", "addenda_sale_point",
+    "addenda_request_date", "addenda_issue_date", "addenda_seller_company_name",
+    "addenda_voucher_number", "addenda_due_date", "raw_json",
 )
 
 _IB_VOUCHERS_KEYS = ("transfer_id",)
@@ -287,6 +292,14 @@ _IB_VOUCHERS_UPDATE = (
     "afip_vep_number", "afip_fiscal_period", "afip_provider_code",
     "credit_account_customer_cuit", "credit_account_account_cbu",
     "credit_account_bank_number", "credit_account_bank_name", "credit_account_account_label",
+    "debit_account_voucher_number",
+    "billing_company_billing_company_cuit", "billing_company_billing_company_name",
+    "billing_company_billing_account_name", "billing_company_billing_seller",
+    "billing_company_billing_account_id", "billing_company_due_date",
+    "paying_customer_voucher_number", "paying_customer_debit_bank",
+    "paying_customer_company_name", "paying_customer_linkage_code",
+    "paying_customer_account_cuit", "paying_customer_account_cbu",
+    "paying_customer_account_label", "paying_customer_customer_cuit",
     "raw_json",
 )
 
@@ -296,9 +309,9 @@ _IB_EXTRACTS_UPDATE = (
     "ending_balance", "operation_code_ib", "operation_code_bank", "code_description_ib",
     "customer_cuit", "depositor_description", "code_description_bank",
     "movement_date", "real_date_activity", "amount", "voucher_number",
-    "branch_office_activity", "process_date", "value_date", "debit_credit_type",
-    "correlative_number", "source_account", "code_description_standard",
-    "operation_code_bank_standard", "raw_json",
+    "grouping_code_ib", "branch_office_activity", "process_date", "value_date",
+    "debit_credit_type", "correlative_number", "source_account",
+    "code_description_standard", "operation_code_bank_standard", "raw_json",
 )
 
 
@@ -453,12 +466,61 @@ class IBProcessor:
         return SyncStats(process, counter["read"], counter["upserted"],
                          int((_utcnow_naive() - started).total_seconds() * 1000))
 
+    def _build_movement_row(
+        self, row: "pd.Series", acc: "pd.Series", feed: str, idx: int
+    ) -> Dict[str, Any]:
+        """Normaliza una fila de movimiento y calcula su movement_hash.
+
+        feed="anteriores": movimientos liquidados (hash natural por sus campos).
+        feed="dia": movimientos del día corriente. IB NO les asigna
+            voucher_number, correlative_number ni movement_date, y su
+            process_date trae la hora exacta de imputación. Cuando ese mismo
+            movimiento se asiente en 'anteriores' (al día hábil siguiente)
+            tendrá otros campos -> otro hash. Para que las filas provisionales
+            'dia' NO colisionen ni se confundan con su versión liquidada,
+            namespaceamos el hash con prefijo "dia" + el índice de lote. Como
+            las filas 'dia' se borran y reescriben enteras cada ciclo, el
+            índice no necesita ser estable entre ciclos.
+        """
+        r = self._normalize_row(row)
+        if feed == "dia":
+            r["movement_hash"] = _sha256(
+                "dia", r.get("source_account"), r.get("process_date"),
+                r.get("amount"), r.get("debit_credit_type"),
+                r.get("operation_code_ib"), r.get("branch_office_activity"), idx,
+            )
+        else:
+            r["movement_hash"] = _sha256(
+                r.get("source_account"), r.get("voucher_number"), r.get("process_date"),
+                r.get("amount"), r.get("debit_credit_type"), r.get("operation_code_ib"),
+                r.get("branch_office_activity"), r.get("correlative_number"),
+            )
+        r = self._row_with_account(r)
+        # account_number no es columna de ib_movements (la cuenta vive
+        # en source_account), pero lo dejamos en el raw_json para trazar.
+        r["account_number"] = to_str(acc.get("account_number"))
+        r["grouping_code_standard"] = to_str(r.get("grouping_code_standard"))
+        r["operation_code_standard"] = to_str(r.get("operation_code_standard"))
+        r["process_date"] = _parse_dt(r.get("process_date"))
+        r["real_date_activity"] = _parse_dt(r.get("real_date_activity"))
+        r["movement_date"] = _parse_dt(r.get("movement_date"))
+        r["value_date"] = _parse_dt(r.get("value_date"))
+        # El feed 'dia' no asigna movement_date; lo derivamos del process_date
+        # (o de hoy) para que las consultas por fecha agrupen el movimiento
+        # bajo el día corriente, igual que las filas liquidadas.
+        if feed == "dia" and r.get("movement_date") is None:
+            r["movement_date"] = r.get("process_date") or _utcnow_naive()
+        r["movement_source"] = feed
+        r["raw_json"] = sanitize_to_json(r, source="ib")
+        return r
+
     def _process_movements(self, begin: str, end: str) -> SyncStats:
         process = "interbanking_movements"
         started = _utcnow_naive()
         b_dt, e_dt = _parse_dt(begin), _parse_dt(end)
         with self._sync_context(process, b_dt, e_dt) as counter:
             accounts_df, _ = self.client.get_cuentas()
+            # --- Fase 1: 'anteriores' (movimientos liquidados) ---
             # Acumulamos todos los movimientos en memoria y hacemos UN solo
             # batch upsert al final. movements suele ser el sub-proceso mas
             # voluminoso del ciclo; antes generaba N x M roundtrips
@@ -474,29 +536,59 @@ class IBProcessor:
                 )
                 counter["read"] += len(movements_df)
                 for _, row in movements_df.iterrows():
-                    r = self._normalize_row(row)
-                    r["movement_hash"] = _sha256(
-                        r.get("source_account"), r.get("voucher_number"), r.get("process_date"),
-                        r.get("amount"), r.get("debit_credit_type"), r.get("operation_code_ib"),
-                        r.get("branch_office_activity"), r.get("correlative_number"),
-                    )
-                    r = self._row_with_account(r)
-                    r["process_date"] = _parse_dt(r.get("process_date"))
-                    r["real_date_activity"] = _parse_dt(r.get("real_date_activity"))
-                    r["movement_date"] = _parse_dt(r.get("movement_date"))
-                    r["value_date"] = _parse_dt(r.get("value_date"))
-                    r["raw_json"] = sanitize_to_json(r, source="ib")
-                    batch.append(r)
+                    batch.append(self._build_movement_row(row, acc, "anteriores", 0))
 
             if batch:
                 with self.db.connect() as conn:
                     cur = conn.cursor()
-                    counter["upserted"] = execute_upsert_batch(
+                    counter["upserted"] += execute_upsert_batch(
                         cur, "finance.ib_movements",
                         _IB_MOVEMENTS_KEYS, _IB_MOVEMENTS_UPDATE,
                         batch, extra_set=None,
                     )
                     conn.commit()
+
+            # --- Fase 2: 'dia' (movimientos del día corriente) ---
+            # IB sólo expone los movimientos del día en curso en el feed 'dia';
+            # recién pasan a 'anteriores' al día hábil siguiente. Sin esta fase
+            # el día corriente nunca se sincroniza (lag de ~1 día). Las filas
+            # 'dia' son PROVISIONALES: las marcamos con movement_source='dia' y
+            # las borramos/reescribimos enteras cada ciclo. Al asentarse en
+            # 'anteriores' (con su hash definitivo) el DELETE de la fila 'dia'
+            # del día previo evita el duplicado.
+            batch_dia: List[Dict[str, Any]] = []
+            for _, acc in accounts_df.iterrows():
+                try:
+                    dia_df, _ = self.client.get_movimientos(
+                        account_number=str(acc["account_number"]),
+                        bank_number=acc["bank_number"],
+                        date_since="", date_until="",
+                        movement_type="dia", version="v2",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "feed 'dia' falló para cuenta %s: %s; continuando",
+                        acc.get("account_number"), exc,
+                    )
+                    continue
+                counter["read"] += len(dia_df)
+                for idx, (_, row) in enumerate(dia_df.iterrows()):
+                    batch_dia.append(self._build_movement_row(row, acc, "dia", idx))
+
+            with self.db.connect() as conn:
+                cur = conn.cursor()
+                # Reemplazo total de las filas provisionales en UNA transacción
+                # (borrar + reinsertar) para no dejar el día corriente vacío.
+                cur.execute(
+                    "DELETE FROM finance.ib_movements WHERE movement_source = 'dia'"
+                )
+                if batch_dia:
+                    counter["upserted"] += execute_upsert_batch(
+                        cur, "finance.ib_movements",
+                        _IB_MOVEMENTS_KEYS, _IB_MOVEMENTS_UPDATE,
+                        batch_dia, extra_set=None,
+                    )
+                conn.commit()
         return SyncStats(process, counter["read"], counter["upserted"],
                          int((_utcnow_naive() - started).total_seconds() * 1000))
 
@@ -518,6 +610,16 @@ class IBProcessor:
                     r["request_date"] = _parse_dt(r.get("request_date"))
                     r["credit_account_account_number"] = to_str(r.get("credit_account_account_number"))
                     r["debit_account_account_number"] = to_str(r.get("debit_account_account_number"))
+                    # Addenda aplanada: códigos a str (evita el "12345.0" de pandas)
+                    # y las tres fechas parseadas a datetime.
+                    for _c in ("addenda_operation_numer", "addenda_payment_receipt",
+                               "addenda_seller_tax_id", "addenda_voucher_type",
+                               "addenda_community_code", "addenda_seller_code",
+                               "addenda_sale_point", "addenda_voucher_number"):
+                        r[_c] = to_str(r.get(_c))
+                    r["addenda_request_date"] = _parse_dt(r.get("addenda_request_date"))
+                    r["addenda_issue_date"] = _parse_dt(r.get("addenda_issue_date"))
+                    r["addenda_due_date"] = _parse_dt(r.get("addenda_due_date"))
                     r["raw_json"] = sanitize_to_json(r, source="ib")
                     execute_upsert(
                         cur, "finance.ib_transfers",
@@ -547,8 +649,15 @@ class IBProcessor:
                     r["request_date"] = _parse_dt(r.get("request_date"))
                     for col in ("network_number", "afip_control_code", "afip_nro_formulario",
                                 "afip_fee_number", "afip_concept_code", "afip_tax_code",
-                                "afip_vep_number", "afip_fiscal_period", "afip_provider_code"):
+                                "afip_vep_number", "afip_fiscal_period", "afip_provider_code",
+                                "debit_account_voucher_number",
+                                "billing_company_billing_company_cuit",
+                                "billing_company_billing_account_id",
+                                "paying_customer_voucher_number", "paying_customer_linkage_code",
+                                "paying_customer_account_cuit", "paying_customer_account_cbu",
+                                "paying_customer_customer_cuit"):
                         r[col] = to_str(r.get(col))
+                    r["billing_company_due_date"] = _parse_dt(r.get("billing_company_due_date"))
                     r["raw_json"] = sanitize_to_json(r, source="ib")
                     execute_upsert(
                         cur, "finance.ib_vouchers",
@@ -584,6 +693,7 @@ class IBProcessor:
                     )
                     r["statement_number"] = to_str(r.get("statement_number"))
                     r["voucher_number"] = to_str(r.get("voucher_number"))
+                    r["grouping_code_ib"] = to_str(r.get("grouping_code_ib"))
                     r["branch_office_activity"] = to_str(r.get("branch_office_activity"))
                     r["correlative_number"] = to_str(r.get("correlative_number"))
                     r["source_account"] = to_str(r.get("source_account"))
