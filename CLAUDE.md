@@ -36,11 +36,11 @@ shared/                       paquete wheel-able (compartido entre Functions)
     interbanking_client.py    cliente REST IB (lazy import de pandas)
     observability.py          configure_logging(): JSON + AppInsights
 
-mp_webhook_function/          Azure Function HTTP (+ queue worker)
-    function_app.py           mp_webhook (HTTP) + mp_process_payment (Queue)
-    mp_client.py              cliente MP API
+mp_webhook_function/          Function MP (HTTP webhook + Queue worker + Timer poller)
+    function_app.py           mp_webhook (HMAC) + mp_process_payment (Queue) + mp_poller_run (Timer)
+    mp_client.py              cliente MP con OAuth2 client_credentials (cache + refresh)
     mp_processor.py           transform + upsert_payment idempotente
-    host.json                 timeout, retries, AppInsights sampling
+    host.json                 functionTimeout 10min + singleton (para el poller)
     requirements.txt          deps + wheel local
 
 ib_poller/                    Azure Function Timer
@@ -127,6 +127,16 @@ cuándo correrlos. Si te piden modificarlos, mantené **idempotencia**
   El cold start es caro.
 - **No reintroducir `os.environ["..."]` en `InterbankingClient.__init__`**.
   Inyectá desde `IbPollerConfig` o usá `from_env()` clasificado.
+- **No instanciar `MercadoPagoClient` con un access_token directo** salvo que
+  uses `access_token_override=` (modo dev local). En prod siempre pasale
+  `client_id` + `client_secret` para que haga OAuth con cache + refresh.
+- **No persistir el access_token MP en Key Vault como `MP_ACCESS_TOKEN` en prod**.
+  El access_token vive en memoria del cliente, no en KV. En KV van
+  `MP-CLIENT-ID` y `MP-CLIENT-SECRET`. `MP_ACCESS_TOKEN` es override opcional
+  para dev local.
+- **No dejar `MP_INITIAL_LOAD=true` permanentemente** en App Settings. Cada
+  ciclo del poller volvería a paginar 365 días. Activalo manualmente, esperá
+  al backfill, apagalo.
 - **No comparar strings de password / token con `==`**. Usar
   `hmac.compare_digest(...)` (timing-safe). Ya se hace en
   `mp_webhook_function/function_app.py:_verify_signature`.

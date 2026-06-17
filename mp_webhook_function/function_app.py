@@ -1,6 +1,6 @@
-"""Azure Functions v2: receptor de webhooks de Mercado Pago + worker que persiste.
+"""Azure Functions v2 — Mercado Pago: webhook + worker + poller incremental.
 
-Dos Functions en la misma app, conectadas por una Queue de Azure Storage:
+Tres funciones en la misma Function App, conectadas por la queue `mp-payment-ids`:
 
     POST /api/mp/webhook        →  mp_webhook (HTTP trigger)
         - Valida HMAC + anti-replay (AZ-02).
@@ -13,18 +13,26 @@ Dos Functions en la misma app, conectadas por una Queue de Azure Storage:
         - UPSERT idempotente con AZ-03.
         - Si falla, el runtime reintenta (default: 5 veces con backoff).
 
-Por qué separar:
-    El SLA del webhook MP es <2s. Antes el handler hacía HMAC + GET MP +
-    UPSERT SQL síncronamente; con MP API lenta (1.5s) y SQL (0.8s) ya nos
-    íbamos del SLA y MP marcaba caído. Encolar el ID toma <50ms y deja el
-    procesamiento a una Function dedicada con su propio retry/observabilidad.
+    Timer (cada 30 min default) →  mp_poller_run (Timer trigger)
+        - Pagina GET /v1/payments/search sobre `date_last_updated` en el rango
+          [ahora - MP_INCREMENTAL_LOOKBACK_HOURS, ahora].
+        - Encola cada payment_id en `mp-payment-ids`; el worker existente hidrata
+          y persiste. Sin código duplicado de upsert.
+        - Si MP_INITIAL_LOAD=true, usa `MP_INITIAL_LOOKBACK_DAYS` (default 365)
+          para una pasada histórica completa.
+        - Idempotencia garantizada por el upsert del worker (`_is_already_current`).
 
-    Bonus: si MP API está caído, el webhook responde 202 igual; el mensaje
-    queda en la queue para reprocesar cuando MP se recupere.
+Por qué webhook + poller juntos:
+    El webhook captura cambios en tiempo real pero MP no garantiza entrega
+    (puede haber webhooks perdidos, rate limits, downtime). El poller es la
+    red de seguridad: cada 30 min recorre el rango reciente y encola lo que
+    haya. Si el webhook ya procesó algo, el upsert lo detecta como idempotente
+    y skipea (`_is_already_current` con date_last_updated).
 
 Referencias:
     Formato HMAC MP: https://www.mercadopago.com.ar/developers/es/docs/your-integrations/notifications/webhooks
-    Queue trigger v2: https://learn.microsoft.com/azure/azure-functions/functions-bindings-storage-queue-trigger
+    OAuth2 client_credentials: doc Rapanui sección 2.
+    Search paginado: doc Rapanui sección 5.
 """
 from __future__ import annotations
 
@@ -34,7 +42,8 @@ import json
 import logging
 import os
 import time
-from typing import Optional, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import azure.functions as func
 import pyodbc
@@ -78,10 +87,15 @@ def _get_config() -> MpWebhookConfig:
 
 
 def _get_mp_client() -> MercadoPagoClient:
+    """Cliente MP único reusado entre invocaciones. El token OAuth queda cacheado adentro."""
     global _cached_mp_client
     if _cached_mp_client is None:
         cfg = _get_config()
-        _cached_mp_client = MercadoPagoClient(cfg.mp_access_token)
+        _cached_mp_client = MercadoPagoClient(
+            client_id=cfg.mp_client_id,
+            client_secret=cfg.mp_client_secret,
+            access_token_override=cfg.mp_access_token,
+        )
     return _cached_mp_client
 
 
@@ -90,6 +104,14 @@ def _get_mp_client() -> MercadoPagoClient:
 # =====================================================================
 
 QUEUE_NAME = os.getenv("MP_PAYMENT_QUEUE_NAME", "mp-payment-ids")
+
+
+# =====================================================================
+# Schedule del poller incremental.
+# Default cada 30 min para complementar el webhook sin saturar la queue.
+# =====================================================================
+
+_POLLER_SCHEDULE = os.getenv("MP_POLLER_SCHEDULE", "0 */30 * * * *")
 
 
 # =====================================================================
@@ -302,3 +324,131 @@ def mp_process_payment(msg: func.QueueMessage) -> None:
         result.charges_upserted,
         result.items_upserted,
     )
+
+
+# =====================================================================
+# Poller incremental (red de seguridad / backfill histórico)
+# =====================================================================
+
+# Cap defensivo: nunca pedir más que esto por ciclo, para no quemar el
+# functionTimeout si MP devuelve un universo gigante por error.
+_MAX_PAGES_PER_RUN = 200    # 200 * 50 = 10_000 pagos por ciclo, suficiente para un día normal.
+
+
+def _poller_window(config: MpWebhookConfig, now: Optional[datetime] = None) -> Tuple[datetime, datetime]:
+    """Calcula la ventana [begin, end] que va a poll-ear este ciclo.
+
+    - Modo incremental (default): ventana `[now - lookback_hours, now]`.
+    - Modo initial-load: ventana `[now - lookback_days, now]` (carga histórica).
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    if config.mp_initial_load:
+        begin = now - timedelta(days=config.mp_initial_lookback_days)
+        logger.info("mp_poller: modo INITIAL_LOAD (lookback=%dd)", config.mp_initial_lookback_days)
+    else:
+        begin = now - timedelta(hours=config.mp_incremental_lookback_hours)
+    return begin, now
+
+
+def collect_payment_ids(
+    client: MercadoPagoClient,
+    begin: datetime,
+    end: datetime,
+    page_delay_seconds: float = 0.2,
+    max_pages: int = _MAX_PAGES_PER_RUN,
+    page_size: int = 50,
+) -> List[str]:
+    """Recolecta los payment_ids del rango sin duplicados, vía slicing por fecha.
+
+    Delega en `client.iter_all_payments`, que esquiva el cap de offset 10_000 de MP
+    partiendo el rango de fechas (sin esto, una ventana con >10_000 matches perdía el
+    resto en silencio). El poller incremental usa `range=date_last_updated` para
+    capturar tanto altas como actualizaciones.
+
+    Función pura (sin side effects de queue/SQL) para que sea testeable. El timer
+    trigger la invoca y después delega el encolado al binding queue_output.
+
+    Cap defensivo: `max_pages * page_size` ids por ciclo. Evita quemar el
+    functionTimeout si una ventana trae un universo inesperadamente grande; el resto
+    entra en los próximos ciclos (o se hace via backfill dedicado).
+    """
+    max_ids = max_pages * page_size
+    enqueued: List[str] = []
+
+    try:
+        for payment in client.iter_all_payments(
+            begin=begin,
+            end=end,
+            range_field="date_last_updated",
+            page_size=page_size,
+            page_delay_seconds=page_delay_seconds,
+        ):
+            pid = payment.get("id")
+            if pid is None:
+                continue
+            enqueued.append(str(pid))
+            if len(enqueued) >= max_ids:
+                logger.warning(
+                    "mp_poller: cap de %d ids alcanzado en [%s, %s]; corte defensivo "
+                    "(el resto entra en próximos ciclos)",
+                    max_ids, begin.isoformat(), end.isoformat(),
+                )
+                break
+    except MercadoPagoError:
+        logger.exception(
+            "mp_poller: search falló; abortando ciclo (lo ya recolectado se encola igual)"
+        )
+
+    logger.info(
+        "mp_poller: ventana [%s, %s] encolados=%d",
+        begin.isoformat(), end.isoformat(), len(enqueued),
+    )
+    return enqueued
+
+
+@app.timer_trigger(
+    schedule=_POLLER_SCHEDULE,
+    arg_name="timer",
+    run_on_startup=False,
+    use_monitor=True,
+)
+@app.queue_output(
+    arg_name="msg_out",
+    queue_name=QUEUE_NAME,
+    connection="AzureWebJobsStorage",
+)
+def mp_poller_run(timer: func.TimerRequest, msg_out: func.Out[List[str]]) -> None:
+    """Timer trigger: pagina /v1/payments/search y encola payment_ids.
+
+    No hidrata ni persiste directamente: solo encola. El worker `mp_process_payment`
+    es la única ruta de escritura a SQL, así garantizamos idempotencia y
+    no duplicamos lógica.
+    """
+    if timer.past_due:
+        logger.warning("mp_poller: timer past_due; arrancando igual")
+
+    try:
+        config = _get_config()
+    except ConfigError:
+        raise
+
+    begin, end = _poller_window(config)
+    delay_seconds = max(config.mp_search_page_delay_ms, 0) / 1000.0
+    enqueued = collect_payment_ids(
+        client=_get_mp_client(),
+        begin=begin,
+        end=end,
+        page_delay_seconds=delay_seconds,
+    )
+
+    if not enqueued:
+        logger.info(
+            "mp_poller: ventana [%s, %s] sin pagos para encolar",
+            begin.isoformat(), end.isoformat(),
+        )
+        return
+
+    # Materializar la encolada en batch. El binding queue_output con List[str]
+    # encola un mensaje por elemento de la lista.
+    msg_out.set(enqueued)

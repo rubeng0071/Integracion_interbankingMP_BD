@@ -19,8 +19,10 @@
        requiere edición Enterprise/Developer/Standard 2016 SP1+.
    ==================================================================== */
 
-USE [TODO_REEMPLAZAR_NOMBRE_BASE];
-GO
+-- Azure SQL no soporta USE: conectar con sqlcmd -d <base> directamente.
+-- En SQL Server on-prem, descomentar:
+--   USE [finance];
+--   GO
 
 /* ====================================================================
    OPS-05 — Indexes para queries frecuentes

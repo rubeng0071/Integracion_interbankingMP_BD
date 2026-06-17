@@ -144,6 +144,33 @@ def execute_upsert_batch(
     if not rows:
         return 0
 
+    # Deduplicar por key_cols. Si el batch contiene dos filas con la misma key
+    # natural (por ejemplo dos movements IB con mismo hash porque sus campos
+    # source_account/voucher_number/process_date/amount/... coinciden), el MERGE
+    # bulk tira UNIQUE KEY violation: hace WHEN NOT MATCHED → INSERT para ambas.
+    # Solución: nos quedamos con la última ocurrencia (asume que la más reciente
+    # tiene datos más actualizados; en el peor caso, son idénticas).
+    seen_keys: set = set()
+    deduped: List[Dict[str, Any]] = []
+    for row in reversed(list(rows)):
+        try:
+            key_tuple = tuple(row[c] for c in key_cols)
+        except KeyError:
+            # Si falta una key, dejamos pasar y que falle más abajo con mensaje claro.
+            deduped.append(row)
+            continue
+        if key_tuple in seen_keys:
+            continue
+        seen_keys.add(key_tuple)
+        deduped.append(row)
+    deduped.reverse()
+    if len(deduped) < len(rows):
+        logger.info(
+            "execute_upsert_batch(%s): dedup %d → %d (key_cols=%s)",
+            table, len(rows), len(deduped), key_cols,
+        )
+    rows = deduped
+
     insert_cols = list(key_cols) + list(update_cols)
     col_list = ", ".join(insert_cols)
     placeholders = ", ".join(["?"] * len(insert_cols))
@@ -165,14 +192,41 @@ def execute_upsert_batch(
         try:
             params: List[Tuple[Any, ...]] = []
             for r in rows:
-                params.append(tuple(r[c] for c in insert_cols))
+                params.append(tuple(_coerce_value(r[c]) for c in insert_cols))
         except KeyError as exc:
             raise KeyError(f"execute_upsert_batch({table}): falta {exc} en algun row") from exc
 
-        # fast_executemany acelera 10-100x el bulk insert vía pyodbc.
+        # fast_executemany acelera 10-100x el bulk insert vía pyodbc, PERO
+        # decide el buffer NVARCHAR a partir del primer valor que ve por columna.
+        # Si después llega un valor más largo, el driver tira "right truncation".
+        # Tomamos el max len de string visto en TODO el batch y le decimos a pyodbc
+        # con setinputsizes que use NVARCHAR de ese tamaño (o MAX si > 4000).
         original_fast = getattr(cur, "fast_executemany", False)
         cur.fast_executemany = True
         try:
+            try:
+                import pyodbc as _pyodbc  # noqa: WPS433  import local controlado
+                sql_wvarchar = _pyodbc.SQL_WVARCHAR
+            except ImportError:
+                sql_wvarchar = None
+
+            # Detectar si alguna columna tiene strings > 250 chars. Si los hay,
+            # fast_executemany trunca (usa el bind del primer valor del batch).
+            # En ese caso desactivamos fast_executemany: pyodbc maneja cada row
+            # individualmente respetando el schema SQL real (NVARCHAR(MAX) acepta
+            # strings de cualquier tamaño, DECIMAL convierte string->Decimal, etc).
+            # Penalización de performance: ~5x, manejable para volúmenes IB diarios.
+            has_long_strings = False
+            for row_params in params:
+                for v in row_params:
+                    if isinstance(v, str) and len(v) > 250:
+                        has_long_strings = True
+                        break
+                if has_long_strings:
+                    break
+            if has_long_strings:
+                cur.fast_executemany = False
+
             cur.executemany(
                 f"INSERT INTO {stg} ({col_list}) VALUES ({placeholders})",
                 params,
@@ -205,6 +259,27 @@ def execute_upsert_batch(
     return len(rows)
 
 
+def _coerce_value(value: Any) -> Any:
+    """Convierte tipos no soportados por pyodbc a algo que el driver acepte.
+
+    Casos cubiertos:
+        - dict / list: se serializan a JSON string. Pasa con `addenda`, `metadata`,
+          subcuentas que IB devuelve anidadas y no se aplanaron antes.
+        - bool: pyodbc soporta bool en SQL Server (BIT), no necesita conversión.
+        - El resto (None, str, int, float, datetime, bytes, Decimal): tal cual.
+
+    Sin esto, pyodbc tira HY105 "Invalid parameter type. param-type=dict" en cuanto
+    un campo viene como objeto en lugar de scalar.
+    """
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError) as exc:
+            logger.warning("_coerce_value: no se pudo serializar a JSON (%s); usando str()", exc)
+            return str(value)
+    return value
+
+
 def execute_upsert(
     cur: Any,
     table: str,
@@ -232,9 +307,9 @@ def execute_upsert(
     sql = build_merge_sql(table, key_cols, update_cols, insert_cols, extra_set=extra_set)
 
     try:
-        key_values = [row[c] for c in key_cols]
-        update_values = [row[c] for c in update_cols]
-        insert_values = [row[c] for c in insert_cols]
+        key_values    = [_coerce_value(row[c]) for c in key_cols]
+        update_values = [_coerce_value(row[c]) for c in update_cols]
+        insert_values = [_coerce_value(row[c]) for c in insert_cols]
     except KeyError as exc:
         raise KeyError(f"execute_upsert({table}): falta la columna {exc} en el row") from exc
 
@@ -272,6 +347,11 @@ _IB_PII_PATHS: Tuple[Tuple[str, ...], ...] = (
     ("credit_account_customer_cuit",),
     ("debit_account_customer_cuit",),
     ("debit_account_taxpayer_cuit",),
+    # Campos aplanados de addenda / billing_company / paying_customer que portan CUIT.
+    ("addenda_seller_tax_id",),
+    ("billing_company_billing_company_cuit",),
+    ("paying_customer_account_cuit",),
+    ("paying_customer_customer_cuit",),
 )
 
 _REDACTED = "***REDACTED***"

@@ -140,6 +140,8 @@ _MOVEMENTS_COLS = [
     "branch_office_activity", "process_date", "debit_credit_type",
     "movement_type", "source_account", "associated_voucher",
     "real_date_activity", "movement_date", "value_date", "correlative_number",
+    # Campos "estándar" que IB devuelve en algunos periodos/movimientos.
+    "grouping_code_standard", "code_description_standard", "operation_code_standard",
 ]
 
 _TRANSFERS_COLS = [
@@ -157,6 +159,12 @@ _TRANSFERS_COLS = [
     "debit_account_account_number", "debit_account_currency",
     "debit_account_account_type", "debit_account_bank_number",
     "debit_account_bank_name", "debit_account_account_label",
+    # Addenda (factura/recaudación) aplanada. `addenda` se conserva como blob JSON.
+    "addenda_operation_numer", "addenda_payment_receipt", "addenda_amount",
+    "addenda_seller_tax_id", "addenda_voucher_type", "addenda_seller_name",
+    "addenda_community_code", "addenda_seller_code", "addenda_sale_point",
+    "addenda_request_date", "addenda_issue_date", "addenda_seller_company_name",
+    "addenda_voucher_number", "addenda_due_date",
 ]
 
 _EXTRACTS_COLS = [
@@ -164,7 +172,8 @@ _EXTRACTS_COLS = [
     "opening_balance", "ending_balance", "operation_code_ib",
     "operation_code_bank", "code_description_ib", "customer_cuit",
     "depositor_description", "code_description_bank", "movement_date",
-    "real_date_activity", "amount", "voucher_number", "branch_office_activity",
+    "real_date_activity", "amount", "voucher_number", "grouping_code_ib",
+    "branch_office_activity",
     "process_date", "value_date", "debit_credit_type", "correlative_number",
     "source_account", "code_description_standard", "operation_code_bank_standard",
 ]
@@ -174,6 +183,7 @@ _VOUCHERS_COLS = [
     "transfer_type_code", "network_number", "amount", "currency",
     "validation_code", "total_amount", "comments", "billing_company",
     "paying_customer", "debit_account_customer_cuit", "debit_account_account_cbu",
+    "debit_account_voucher_number",
     "debit_account_taxpayer_cuit", "debit_account_bank_number",
     "debit_account_bank_name", "debit_account_account_label",
     "afip_concept_description", "afip_control_code", "afip_nro_formulario",
@@ -183,6 +193,15 @@ _VOUCHERS_COLS = [
     "credit_account_customer_cuit", "credit_account_account_cbu",
     "credit_account_bank_number", "credit_account_bank_name",
     "credit_account_account_label",
+    # billing_company aplanada (`billing_company` se conserva como blob JSON).
+    "billing_company_billing_company_cuit", "billing_company_billing_company_name",
+    "billing_company_billing_account_name", "billing_company_billing_seller",
+    "billing_company_billing_account_id", "billing_company_due_date",
+    # paying_customer aplanada (`paying_customer` se conserva como blob JSON).
+    "paying_customer_voucher_number", "paying_customer_debit_bank",
+    "paying_customer_company_name", "paying_customer_linkage_code",
+    "paying_customer_account_cuit", "paying_customer_account_cbu",
+    "paying_customer_account_label", "paying_customer_customer_cuit",
 ]
 
 
@@ -417,61 +436,86 @@ _VOUCHER_FIELD_MAP: Dict[str, str] = {
 # Helpers de aplanado para cuentas crédito/débito en transferencias
 # ---------------------------------------------------------------------------
 
+# Sub-claves camelCase/castellano → snake para cuentas anidadas.
+# La API real ya devuelve snake_case (credit_account.account_cbu, etc.), por lo
+# que para datos reales el flatten es directo; este mapa solo cubre variantes
+# legacy. ANTES los helpers solo desempaquetaban camelCase ("creditAccount"),
+# así que con la API snake_case las columnas credit_account_*/debit_account_*
+# quedaban en NULL: este fix lo corrige soportando ambas convenciones.
+_ACCOUNT_SUBKEY_MAP: Dict[str, str] = {
+    "cuit":              "customer_cuit",
+    "customerCuit":      "customer_cuit",
+    "cuitContribuyente": "taxpayer_cuit",
+    "cbu":               "account_cbu",
+    "accountCbu":        "account_cbu",
+    "numeroCuenta":      "account_number",
+    "accountNumber":     "account_number",
+    "moneda":            "currency",
+    "tipoCuenta":        "account_type",
+    "accountType":       "account_type",
+    "numeroBanco":       "bank_number",
+    "bankNumber":        "bank_number",
+    "nombreBanco":       "bank_name",
+    "bankName":          "bank_name",
+    "alias":             "account_label",
+    "label":             "account_label",
+}
+
+
+def _pop_first(record: Dict[str, Any], *keys: str) -> Any:
+    """Devuelve y elimina el valor del primer key presente; None si ninguno está."""
+    for k in keys:
+        if k in record:
+            return record.pop(k)
+    return None
+
+
+def _flatten_account(record: Dict[str, Any], prefix: str, *source_keys: str) -> None:
+    """Aplana una cuenta anidada (credit/debit) a columnas {prefix}_{subclave}.
+
+    Soporta el snake_case real de la API (credit_account.account_cbu) y variantes
+    camelCase/castellano legacy via _ACCOUNT_SUBKEY_MAP.
+    """
+    nested = _pop_first(record, *source_keys)
+    if isinstance(nested, dict):
+        for k, v in nested.items():
+            record[f"{prefix}_{_ACCOUNT_SUBKEY_MAP.get(k, k)}"] = v
+
+
+def _flatten_blob(record: Dict[str, Any], prefix: str, *source_keys: str) -> None:
+    """Aplana un dict anidado a columnas {prefix}_{subclave} y CONSERVA el dict
+    original bajo `prefix` para persistirlo además como blob JSON.
+
+    Para addenda / billing_company / paying_customer guardamos ambas
+    representaciones: columnas individuales (consultables) + el blob completo.
+    La API ya devuelve snake_case, así que el prefijo directo produce los nombres
+    finales (addenda_amount, billing_company_due_date, etc.).
+    """
+    nested = _pop_first(record, *source_keys)
+    if isinstance(nested, dict):
+        for k, v in nested.items():
+            record[f"{prefix}_{k}"] = v
+        record[prefix] = nested  # re-inserción para el blob JSON
+    elif nested is not None:
+        record[prefix] = nested
+
+
 def _flatten_transfer_accounts(record: Dict[str, Any]) -> Dict[str, Any]:
-    """Aplana cuentaCreditora y cuentaDebitora en campos prefijados."""
-    for api_key, prefix in [
-        ("cuentaCreditora",  "credit_account"),
-        ("creditAccount",    "credit_account"),
-        ("cuentaDebitora",   "debit_account"),
-        ("debitAccount",     "debit_account"),
-    ]:
-        nested = record.pop(api_key, None) or {}
-        if isinstance(nested, dict):
-            sub_map = {
-                "cuit":          f"{prefix}_customer_cuit",
-                "customerCuit":  f"{prefix}_customer_cuit",
-                "cbu":           f"{prefix}_account_cbu",
-                "accountCbu":    f"{prefix}_account_cbu",
-                "numeroCuenta":  f"{prefix}_account_number",
-                "accountNumber": f"{prefix}_account_number",
-                "moneda":        f"{prefix}_currency",
-                "currency":      f"{prefix}_currency",
-                "tipoCuenta":    f"{prefix}_account_type",
-                "accountType":   f"{prefix}_account_type",
-                "numeroBanco":   f"{prefix}_bank_number",
-                "bankNumber":    f"{prefix}_bank_number",
-                "nombreBanco":   f"{prefix}_bank_name",
-                "bankName":      f"{prefix}_bank_name",
-                "alias":         f"{prefix}_account_label",
-                "label":         f"{prefix}_account_label",
-            }
-            for k, v in nested.items():
-                record[sub_map.get(k, f"{prefix}_{k}")] = v
+    """Aplana cuentas crédito/débito y la addenda en una transferencia."""
+    _flatten_account(record, "credit_account", "credit_account", "creditAccount", "cuentaCreditora")
+    _flatten_account(record, "debit_account", "debit_account", "debitAccount", "cuentaDebitora")
+    _flatten_blob(record, "addenda", "addenda")
     return record
 
 
 def _flatten_voucher_accounts(record: Dict[str, Any]) -> Dict[str, Any]:
-    """Aplana cuentas y datos AFIP en comprobantes."""
-    for api_key, prefix in [
-        ("cuentaCreditora",  "credit_account"),
-        ("creditAccount",    "credit_account"),
-        ("cuentaDebitora",   "debit_account"),
-        ("debitAccount",     "debit_account"),
-    ]:
-        nested = record.pop(api_key, None) or {}
-        if isinstance(nested, dict):
-            sub_map = {
-                "cuit":           f"{prefix}_customer_cuit",
-                "cbu":            f"{prefix}_account_cbu",
-                "cuitContribuyente": f"debit_account_taxpayer_cuit",
-                "numeroBanco":    f"{prefix}_bank_number",
-                "nombreBanco":    f"{prefix}_bank_name",
-                "alias":          f"{prefix}_account_label",
-            }
-            for k, v in nested.items():
-                record[sub_map.get(k, f"{prefix}_{k}")] = v
+    """Aplana cuentas, empresa facturadora, cliente pagador y datos AFIP."""
+    _flatten_account(record, "credit_account", "credit_account", "creditAccount", "cuentaCreditora")
+    _flatten_account(record, "debit_account", "debit_account", "debitAccount", "cuentaDebitora")
+    _flatten_blob(record, "billing_company", "billing_company", "billingCompany", "empresaFacturadora")
+    _flatten_blob(record, "paying_customer", "paying_customer", "payingCustomer", "clientePagador")
 
-    afip = record.pop("afip", None) or record.pop("datosAfip", None) or {}
+    afip = _pop_first(record, "afip", "datosAfip")
     if isinstance(afip, dict):
         afip_map = {
             "descripcionConcepto":  "afip_concept_description",
@@ -646,6 +690,7 @@ class InterbankingClient:
 
     def _api_headers(self) -> Dict[str, str]:
         # _get_token() devuelve el str plano solo durante la construcción del header.
+        # IB NO requiere customer-id en header: va como query param en cada request.
         return {
             "Authorization": f"Bearer {self._get_token()}",
             "client_id":     self.client_id,
@@ -655,23 +700,38 @@ class InterbankingClient:
 
     # ------------------------------------------------------------------
     # HTTP helpers
+    #
+    # IMPORTANTE: la API de Interbanking exige `customer-id` como QUERY PARAM
+    # (kebab-case) en cada request a /v1/*. Sin él, devuelve 400 "missing
+    # required API parameters". Lo inyectamos automáticamente en _get para
+    # que ningún caller pueda olvidárselo. Todos los demás params también
+    # van en kebab-case: date-since, date-until, account-number, bank-number,
+    # account-type, currency.
     # ------------------------------------------------------------------
 
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         url = f"{self.api_base_url}{path}"
-        logger.debug("GET %s params=%s", url, params)
-        response = self.session.get(url, headers=self._api_headers(), params=params, timeout=self.timeout)
+        merged_params: Dict[str, Any] = {"customer-id": self.customer_id}
+        if params:
+            merged_params.update(params)
+        logger.debug("GET %s params=%s", url, merged_params)
+        response = self.session.get(url, headers=self._api_headers(), params=merged_params, timeout=self.timeout)
         response.raise_for_status()
         return response.json()
 
     def _get_paginated(self, path: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """Itera páginas y devuelve todos los registros concatenados.
 
-        Interbanking puede devolver los resultados bajo distintas claves:
-        'data', 'results', 'items', 'content' o directamente como lista.
+        IB devuelve los resultados bajo claves específicas según el endpoint:
+        - /accounts                            → {"accounts": [...], "general_data": {...}}
+        - /accounts/balances                   → {"accounts": [...], "general_data": {...}}
+        - /accounts/{id}/movements/{type}      → {"movements_detail": [...], "general_data": {...}}
+        - /transfers/details                   → {"transfers": [...], "general_data": {...}}
+        - /transfers/vouchers                  → {"transfers": [...], "general_data": {...}}
+        - /accounts/{id}/statements            → {"statements": [...], "general_data": {...}}
         """
         base_params = dict(params or {})
-        base_params.setdefault("size", self.page_size)
+        base_params.setdefault("limit", self.page_size)
 
         all_records: List[Dict[str, Any]] = []
         page = 0
@@ -699,15 +759,34 @@ class InterbankingClient:
         if isinstance(raw, list):
             return raw
         if isinstance(raw, dict):
-            for key in ("data", "results", "items", "content", "movimientos",
-                        "cuentas", "saldos", "transferencias", "extractos", "comprobantes"):
+            for key in (
+                # claves reales de IB API
+                "accounts", "transfers", "statements", "movements_detail",
+                # alternativas posibles
+                "data", "results", "items", "content",
+                # legacy / castellano (mantenidas por compat con versiones futuras)
+                "movimientos", "cuentas", "saldos", "transferencias", "extractos", "comprobantes",
+            ):
                 if key in raw and isinstance(raw[key], list):
                     return raw[key]
         return []
 
     def _has_next_page(self, raw: Any, current_page: int, returned: int) -> bool:
-        """Detecta si hay más páginas."""
+        """Detecta si hay más páginas.
+
+        IB usa `general_data.total_rows` como total absoluto. Si el limit por
+        request es N y devolvió menos de N, asumimos fin del set.
+        """
         if isinstance(raw, dict):
+            general = raw.get("general_data") or {}
+            if isinstance(general, dict):
+                if "total_rows" in general:
+                    try:
+                        total = int(general["total_rows"])
+                        fetched_so_far = (current_page + 1) * self.page_size
+                        return fetched_so_far < total
+                    except (TypeError, ValueError):
+                        pass
             if "totalPages" in raw:
                 return current_page + 1 < int(raw["totalPages"])
             if "last" in raw:
@@ -721,15 +800,18 @@ class InterbankingClient:
     # Métodos públicos
     # ------------------------------------------------------------------
 
-    def get_cuentas(self) -> Tuple[pd.DataFrame, Any]:
-        """GET /accounts — Lista de cuentas bancarias."""
-        raw = self._get("/accounts")
-        records = self._extract_records(raw) if not isinstance(raw, list) else raw
+    def get_cuentas(self) -> Tuple["pd.DataFrame", Any]:  # noqa: F821
+        """GET /v1/accounts — Lista de cuentas bancarias.
 
-        normalized = []
-        for rec in records:
-            r = _rename(dict(rec), _ACCOUNT_FIELD_MAP)
-            normalized.append(r)
+        Devuelve {"general_data": {...}, "accounts": [{bank_number, account_cbu,
+        account_cuit, account_label, currency, bank_name, account_number, account_type}]}.
+        """
+        raw = self._get("/accounts", {"limit": self.page_size, "page": 0})
+        records = self._extract_records(raw)
+
+        # La API ya devuelve snake_case; el rename es no-op para esos campos pero
+        # cubre cualquier variante camelCase / castellano que la API pueda emitir.
+        normalized = [_rename(dict(rec), _ACCOUNT_FIELD_MAP) for rec in records]
 
         df = _to_df(normalized, _ACCOUNTS_COLS)
         logger.info("get_cuentas: %d cuentas obtenidas", len(df))
@@ -740,30 +822,63 @@ class InterbankingClient:
         date_since: Optional[str] = None,
         date_until: Optional[str] = None,
         account_numbers: Optional[List[str]] = None,
-    ) -> Tuple[pd.DataFrame, Any]:
-        """GET /accounts/balances — Saldos en un rango de fechas y/o cuentas específicas.
+    ) -> Tuple["pd.DataFrame", Any]:  # noqa: F821
+        """GET /v1/accounts/balances — Saldos en un rango de fechas y/o cuentas específicas.
 
         Todos los parámetros son opcionales:
         - Sin fechas devuelve saldos actuales.
         - account_numbers filtra por lista de números de cuenta.
+
+        IB anida `balances` y `historical_balances` dentro de cada account; los aplanamos
+        para producir una fila por (cuenta, fecha) en el DataFrame final.
         """
         params: Dict[str, Any] = {}
         if date_since:
-            params.update({"dateSince": date_since, "dateFrom": date_since, "fechaDesde": date_since})
+            params["date-since"] = date_since
         if date_until:
-            params.update({"dateUntil": date_until, "dateTo": date_until, "fechaHasta": date_until})
+            params["date-until"] = date_until
         if account_numbers:
-            params["accountNumbers"] = ",".join(str(n) for n in account_numbers)
-            params["numeroCuentas"] = params["accountNumbers"]
+            params["account-number"] = list(account_numbers) if isinstance(account_numbers, list) else [account_numbers]
 
         records = self._get_paginated("/accounts/balances", params)
 
-        normalized = []
-        for rec in records:
-            r = _rename(dict(rec), _BALANCE_FIELD_MAP)
-            normalized.append(r)
+        # IB devuelve cada cuenta con balances anidados; aplanamos a filas independientes.
+        flattened: List[Dict[str, Any]] = []
+        for account in records:
+            base = {
+                "bank_number":     account.get("bank_number"),
+                "account_number":  account.get("account_number"),
+                "account_type":    account.get("account_type"),
+                "currency":        account.get("currency"),
+                "account_label":   account.get("account_label"),
+                "account_name":    account.get("account_name"),
+                "row_date":        account.get("row_date"),
+                "message":         account.get("message"),
+            }
+            balances = account.get("balances") or {}
+            if isinstance(balances, dict):
+                base.update({
+                    "countable_balance":         balances.get("countable_balance"),
+                    "initial_operating_balance": balances.get("initial_operating_balance"),
+                    "current_operating_balance": balances.get("current_operating_balance"),
+                    "projected_balance_24hs":    balances.get("projected_balance_24hs"),
+                    "projected_balance_48hs":    balances.get("projected_balance_48hs"),
+                })
+            flattened.append(base)
+            for hist in (account.get("historical_balances") or []):
+                if not isinstance(hist, dict):
+                    continue
+                row = base.copy()
+                row.update({
+                    "operation_date": hist.get("operation_date"),
+                    "day_balance":    hist.get("day_balance"),
+                    "total_debits":   hist.get("total_debits"),
+                    "total_credits":  hist.get("total_credits"),
+                    "is_historical":  True,
+                })
+                flattened.append(row)
 
-        df = _to_df(normalized, _BALANCES_COLS)
+        df = _to_df(flattened, _BALANCES_COLS)
         logger.info("get_saldos: %d filas [%s → %s]", len(df), date_since, date_until)
         return df, records
 
@@ -775,83 +890,105 @@ class InterbankingClient:
         date_until: str,
         movement_type: str = "anteriores",
         version: str = "v2",
-    ) -> Tuple[pd.DataFrame, Any]:
-        """GET /accounts/movements — Movimientos de una cuenta en un rango de fechas.
+        account_type: str = "CC",
+        currency: str = "ARS",
+    ) -> Tuple["pd.DataFrame", Any]:  # noqa: F821
+        """GET /{v1|v2}/accounts/{account_number}/movements/{movement_type} — Movimientos.
 
-        movement_type: "anteriores" | "dia" | "diferidos"
+        movement_type: "anteriores" | "dia" | "diferidos" | "zughus" (solo v2)
         version:       "v1" | "v2"
+        account_type:  "CC" (cta corriente) | "CA" (caja ahorro) | etc.
+
+        Endpoint según versión IB:
+            v1 -> /v1/accounts/{account_number}/movements/{movement_type}
+            v2 -> /v2/accounts/{account_number}/movements/{movement_type}
         """
-        path = f"/accounts/movements"
-        params = {
-            "accountNumber":  account_number,
-            "numeroCuenta":   account_number,
-            "bankNumber":     bank_number,
-            "numeroBanco":    bank_number,
-            "dateSince":      date_since,
-            "dateUntil":      date_until,
-            "fechaDesde":     date_since,
-            "fechaHasta":     date_until,
-            "movementType":   movement_type,
-            "tipoMovimiento": movement_type,
-            "version":        version,
+        # IB cambia el prefijo de versión por endpoint. Construimos la URL manualmente
+        # quitando el /v1 del api_base_url y agregando la versión correcta.
+        if self.api_base_url.endswith("/v1"):
+            base_without_version = self.api_base_url[:-3]
+        else:
+            base_without_version = self.api_base_url
+        path_for_log = f"/{version}/accounts/{account_number}/movements/{movement_type}"
+        full_url = f"{base_without_version}{path_for_log}"
+
+        params: Dict[str, Any] = {
+            "customer-id":  self.customer_id,    # se mantiene igual: el query param es la fuente de verdad
+            "account-type": account_type,
+            "currency":     currency,
+            "bank-number":  bank_number,
+            "limit":        self.page_size,
         }
-        records = self._get_paginated(path, params)
+        # 'dia' es solo el día actual; las otras opciones aceptan ventana de fechas.
+        if movement_type != "dia":
+            if date_since: params["date-since"] = date_since
+            if date_until: params["date-until"] = date_until
 
-        normalized = []
-        for rec in records:
-            r = _rename(dict(rec), _MOVEMENT_FIELD_MAP)
-            normalized.append(r)
+        # Iteramos paginación manual porque _get_paginated usa _get que asume path
+        # relativo a self.api_base_url. Aquí pegamos contra full_url custom.
+        all_records: List[Dict[str, Any]] = []
+        page = 0
+        while True:
+            params["page"] = page
+            logger.debug("GET %s params=%s", full_url, params)
+            response = self.session.get(full_url, headers=self._api_headers(), params=params, timeout=self.timeout)
+            response.raise_for_status()
+            raw = response.json()
+            records = self._extract_records(raw)
+            if not records:
+                break
+            all_records.extend(records)
+            if not self._has_next_page(raw, page, len(records)):
+                break
+            page += 1
 
+        normalized = [_rename(dict(r), _MOVEMENT_FIELD_MAP) for r in all_records]
+        # La API NO incluye la cuenta de origen ni el tipo de movimiento dentro de
+        # cada registro: los inyectamos desde los parámetros del request, igual que
+        # el cliente de referencia (jsontoexcel) que hace mov_df['source_account'] =
+        # account_number. Sin esto source_account queda NULL; y como el
+        # movement_hash lo usa para deduplicar, movimientos de cuentas distintas
+        # con el mismo comprobante/importe colisionarían y se pisarían.
+        for rec in normalized:
+            rec["source_account"] = account_number
+            rec["movement_type"] = movement_type
         df = _to_df(normalized, _MOVEMENTS_COLS)
         logger.info(
-            "get_movimientos cuenta=%s banco=%s: %d movimientos [%s → %s]",
-            account_number, bank_number, len(df), date_since, date_until,
+            "get_movimientos cuenta=%s banco=%s tipo=%s v=%s: %d movimientos [%s → %s]",
+            account_number, bank_number, movement_type, version, len(df), date_since, date_until,
         )
-        return df, records
+        return df, all_records
 
     def get_transferencias_detalle(
         self, date_since: str, date_until: str
-    ) -> Tuple[pd.DataFrame, Any]:
-        """GET /transfers — Transferencias con detalle de cuentas crédito/débito."""
+    ) -> Tuple["pd.DataFrame", Any]:  # noqa: F821
+        """GET /v1/transfers/details — Transferencias con detalle de cuentas crédito/débito.
+
+        El endpoint correcto es /transfers/details (no /transfers — el /v1/transfers
+        sin /details devuelve 404 en el gateway actual).
+        """
         params = {
-            "dateSince":  date_since,
-            "dateUntil":  date_until,
-            "fechaDesde": date_since,
-            "fechaHasta": date_until,
+            "date-since": date_since,
+            "date-until": date_until,
         }
-        records = self._get_paginated("/transfers", params)
+        records = self._get_paginated("/transfers/details", params)
 
-        normalized = []
-        for rec in records:
-            r = _flatten_transfer_accounts(dict(rec))
-            r = _rename(r, _TRANSFER_FIELD_MAP)
-            normalized.append(r)
-
+        normalized = [_rename(_flatten_transfer_accounts(dict(r)), _TRANSFER_FIELD_MAP) for r in records]
         df = _to_df(normalized, _TRANSFERS_COLS)
         logger.info("get_transferencias_detalle: %d transferencias [%s → %s]", len(df), date_since, date_until)
         return df, records
 
     def get_comprobantes(
         self, date_since: str, date_until: str
-    ) -> Tuple[pd.DataFrame, Any]:
-        """GET /transfers/vouchers — Comprobantes de transferencias (pagos de impuestos, etc.).
-
-        Este método es opcional: solo se llama si está disponible (hasattr check en el servicio).
-        """
+    ) -> Tuple["pd.DataFrame", Any]:  # noqa: F821
+        """GET /v1/transfers/vouchers — Comprobantes de transferencias."""
         params = {
-            "dateSince":  date_since,
-            "dateUntil":  date_until,
-            "fechaDesde": date_since,
-            "fechaHasta": date_until,
+            "date-since": date_since,
+            "date-until": date_until,
         }
         records = self._get_paginated("/transfers/vouchers", params)
 
-        normalized = []
-        for rec in records:
-            r = _flatten_voucher_accounts(dict(rec))
-            r = _rename(r, _VOUCHER_FIELD_MAP)
-            normalized.append(r)
-
+        normalized = [_rename(_flatten_voucher_accounts(dict(r)), _VOUCHER_FIELD_MAP) for r in records]
         df = _to_df(normalized, _VOUCHERS_COLS)
         logger.info("get_comprobantes: %d comprobantes [%s → %s]", len(df), date_since, date_until)
         return df, records
@@ -862,25 +999,52 @@ class InterbankingClient:
         bank_number: str,
         date_since: str,
         date_until: str,
-    ) -> Tuple[pd.DataFrame, Any]:
-        """GET /accounts/statements — Extractos de una cuenta en un rango de fechas."""
-        params = {
-            "accountNumber": account_number,
-            "numeroCuenta":  account_number,
-            "bankNumber":    bank_number,
-            "numeroBanco":   bank_number,
-            "dateSince":     date_since,
-            "dateUntil":     date_until,
-            "fechaDesde":    date_since,
-            "fechaHasta":    date_until,
+        account_type: str = "CC",
+        currency: str = "ARS",
+    ) -> Tuple["pd.DataFrame", Any]:  # noqa: F821
+        """GET /v1/accounts/{account_number}/statements — Extractos de una cuenta.
+
+        IB devuelve {"statements":[{statement_info, "movement_detail":[{movements}]}]};
+        aplanamos para producir una fila por movimiento, conservando los datos del extracto.
+        """
+        params: Dict[str, Any] = {
+            "account-type": account_type,
+            "bank-number":  bank_number,
+            "currency":     currency,
+            "date-since":   date_since,
+            "date-until":   date_until,
         }
-        records = self._get_paginated("/accounts/statements", params)
+        records = self._get_paginated(f"/accounts/{account_number}/statements", params)
 
-        normalized = []
-        for rec in records:
-            r = _rename(dict(rec), _EXTRACT_FIELD_MAP)
-            normalized.append(r)
+        # Aplanar: cada movement_detail dentro de statement genera una fila propia.
+        flattened: List[Dict[str, Any]] = []
+        for statement in records:
+            if not isinstance(statement, dict):
+                continue
+            base = {
+                "statement_number": statement.get("statement_number"),
+                "operation_date":   statement.get("operation_date"),
+                "total_movements":  statement.get("total_movements"),
+                "opening_balance":  statement.get("opening_balance"),
+                "ending_balance":   statement.get("ending_balance"),
+            }
+            movement_detail = statement.get("movement_detail") or statement.get("movements_detail") or []
+            if movement_detail:
+                for mov in movement_detail:
+                    if not isinstance(mov, dict):
+                        continue
+                    row = base.copy()
+                    row.update(mov)
+                    flattened.append(row)
+            else:
+                flattened.append(base)
 
+        normalized = [_rename(dict(r), _EXTRACT_FIELD_MAP) for r in flattened]
+        # Igual que en movimientos: source_account no viene en el detalle del
+        # extracto, se inyecta desde el parámetro account_number (lo mismo hace el
+        # cliente de referencia). El extract_hash lo usa para deduplicar por cuenta.
+        for rec in normalized:
+            rec["source_account"] = account_number
         df = _to_df(normalized, _EXTRACTS_COLS)
         logger.info(
             "get_extractos cuenta=%s banco=%s: %d filas [%s → %s]",

@@ -8,7 +8,7 @@
 
 # Identidad de la suscripción donde se crea todo.
 # Reemplazá por el nombre o ID que ves con `az account list`.
-if (-not $Subscription) { $Subscription = "TODO_NOMBRE_O_ID_DE_LA_SUB" }
+if (-not $Subscription) { $Subscription = "517ff6e9-04fa-44ed-8c2e-06561f635035" }
 
 # Slug de environment. Cambialo a "staging" o "dev" para crear un set
 # paralelo de recursos sin colisionar con prod.
@@ -16,11 +16,11 @@ if (-not $Env) { $Env = "prod" }
 
 # Región Azure. Las dos Functions y SQL deben estar en la misma región
 # para minimizar latencia (el poller hace varias roundtrips a SQL).
-if (-not $Location) { $Location = "eastus" }
+if (-not $Location) { $Location = "eastus2" }
 
 # Sufijo para nombres globales (Storage, Key Vault, SQL Server requieren
 # unicidad global). Cambialo si chocás contra otro tenant.
-if (-not $Suffix) { $Suffix = "finance-sync" }
+if (-not $Suffix) { $Suffix = "rapanui-finance" }
 
 # ---------------------------------------------------------------------
 # Nombres derivados. NO suelen necesitar override.
@@ -33,8 +33,19 @@ $KeyVault             = "kv-$Suffix-$Env"
 # Storage requiere lowercase, alfanumérico, <=24 chars.
 $StorageAccount       = ("st" + ($Suffix -replace '-','') + $Env).ToLower()
 if ($StorageAccount.Length -gt 24) { $StorageAccount = $StorageAccount.Substring(0,24) }
-$SqlServer            = "sql-$Suffix-$Env"
-$SqlDatabase          = "finance"
+
+# SQL Server: puede ser uno NUEVO (creado por 20-create-sql.ps1) o uno EXISTENTE.
+# Para usar uno existente, exportar como env var antes de correr los scripts:
+#   $env:SqlServer = "nombre-corto-sin-database-windows-net"
+#   $env:SqlServerResourceGroup = "rg-donde-vive-el-server"  (si no esta en $ResourceGroup)
+#   $env:SqlAdminUser = "rapanuisa"  (default es 'sqladmin')
+# En PowerShell, $env:X y $X son namespaces distintos: leemos primero del env,
+# despues caemos al default. Sin esto, las env vars exportadas se ignorarian.
+if (-not $SqlServer)              { $SqlServer = if ($env:SqlServer) { $env:SqlServer } else { "sql-$Suffix-$Env" } }
+if (-not $SqlServerResourceGroup) { $SqlServerResourceGroup = if ($env:SqlServerResourceGroup) { $env:SqlServerResourceGroup } else { $ResourceGroup } }
+if (-not $SqlAdminUser)           { $SqlAdminUser = if ($env:SqlAdminUser) { $env:SqlAdminUser } else { "sqladmin" } }
+if (-not $SqlDatabase)            { $SqlDatabase = if ($env:SqlDatabase) { $env:SqlDatabase } else { "finance" } }
+
 $FunctionAppMp        = "func-mp-webhook-$Env"
 $FunctionAppIb        = "func-ib-poller-$Env"
 

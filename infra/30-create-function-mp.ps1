@@ -85,12 +85,23 @@ $aiConn = az monitor app-insights component show `
 $kvUri = "https://$KeyVault.vault.azure.net/"
 
 Write-Step "Configurando App Settings"
+# MP_POLLER_SCHEDULE: NCRONTAB cada 30 min para el batch poller que complementa el webhook.
+# MP_INCREMENTAL_LOOKBACK_HOURS: ventana incremental por ciclo (4h cubre webhooks perdidos
+#   sin pelearse con la idempotencia del upsert).
+# MP_INITIAL_LOAD: poner "true" UNA VEZ para forzar carga histórica de MP_INITIAL_LOOKBACK_DAYS;
+#   despues volver a "false" o el poller hace 365 dias en cada ciclo.
+# MP_SEARCH_PAGE_DELAY_MS: respeta rate limit MP (~10 req/s segun doc Rapanui).
 az functionapp config appsettings set `
     --name $Name --resource-group $ResourceGroup `
     --settings `
         "APPLICATIONINSIGHTS_CONNECTION_STRING=$aiConn" `
         "AZURE_KEY_VAULT_URI=$kvUri" `
         "MP_PAYMENT_QUEUE_NAME=$PaymentQueue" `
+        "MP_POLLER_SCHEDULE=0 */30 * * * *" `
+        "MP_INCREMENTAL_LOOKBACK_HOURS=4" `
+        "MP_INITIAL_LOAD=false" `
+        "MP_INITIAL_LOOKBACK_DAYS=365" `
+        "MP_SEARCH_PAGE_DELAY_MS=200" `
         "LOG_LEVEL=INFO" `
         "PYTHON_ENABLE_WORKER_EXTENSIONS=1" `
     --output none

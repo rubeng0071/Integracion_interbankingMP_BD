@@ -168,6 +168,70 @@ class TestExecuteUpsert:
         sql = cur.execute.call_args.args[0]
         assert "updated_at=SYSUTCDATETIME()" in sql
 
+    def test_coerce_dict_a_json_string(self) -> None:
+        """Regresión 2026-05-22: ib_transfers.addenda llegaba como dict desde IB.
+
+        Antes del fix, pyodbc rechazaba el parámetro con:
+            HY105 Invalid parameter type. param-index=18 param-type=dict
+        execute_upsert debe pasarle JSON string al driver, no el dict crudo.
+        """
+        cur = MagicMock()
+        addenda = {"motivo": "pago factura", "ref": "F-001"}
+        execute_upsert(
+            cur,
+            table="finance.ib_transfers",
+            key_cols=("transfer_id",),
+            update_cols=("addenda",),
+            row={"transfer_id": 42, "addenda": addenda},
+            extra_set=None,
+        )
+        params = list(cur.execute.call_args.args[1:])
+        # key + update + insert  =>  [42, addenda_json, 42, addenda_json]
+        assert len(params) == 4
+        # Ninguno de los params puede ser dict; el dict tiene que estar como JSON.
+        for p in params:
+            assert not isinstance(p, dict)
+        # El JSON string debe contener los valores originales.
+        json_params = [p for p in params if isinstance(p, str) and p.startswith("{")]
+        assert json_params, "Se esperaba al menos un JSON string"
+        decoded = json.loads(json_params[0])
+        assert decoded == addenda
+
+    def test_coerce_list_a_json_string(self) -> None:
+        """Lo mismo que dict pero con list (también pyodbc-incompatible)."""
+        cur = MagicMock()
+        items = [{"id": 1}, {"id": 2}]
+        execute_upsert(
+            cur,
+            table="finance.t",
+            key_cols=("id",),
+            update_cols=("items",),
+            row={"id": 1, "items": items},
+            extra_set=None,
+        )
+        params = list(cur.execute.call_args.args[1:])
+        for p in params:
+            assert not isinstance(p, (dict, list))
+
+    def test_coerce_scalars_no_se_modifican(self) -> None:
+        """Tipos que pyodbc maneja nativos no deben envolverse en json.dumps."""
+        cur = MagicMock()
+        execute_upsert(
+            cur,
+            table="finance.t",
+            key_cols=("id",),
+            update_cols=("name", "amount", "active", "missing"),
+            row={"id": 1, "name": "foo", "amount": 12.5, "active": True, "missing": None},
+            extra_set=None,
+        )
+        params = list(cur.execute.call_args.args[1:])
+        # Buscamos los 4 valores update + 4 valores insert (= 8 + 1 key = 9).
+        assert 1 in params
+        assert "foo" in params
+        assert 12.5 in params
+        assert True in params
+        assert None in params
+
 
 # =====================================================================
 # execute_upsert_batch  (CAL-02)

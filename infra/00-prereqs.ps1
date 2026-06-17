@@ -8,7 +8,10 @@ $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\_config.ps1"
 
 Write-Step "Verificando az CLI"
-$azVersion = az version --query '"azure-cli"' -o tsv 2>$null
+# PowerShell pierde las comillas dobles internas que JMESPath necesita para
+# claves con guion como 'azure-cli'. Mejor parsear el JSON completo.
+$azJson = az version -o json 2>$null | ConvertFrom-Json
+$azVersion = if ($azJson) { $azJson.'azure-cli' } else { $null }
 if (-not $azVersion) { Fail "az CLI no encontrado. Instalá con: winget install Microsoft.AzureCLI" }
 Write-Ok "az $azVersion"
 

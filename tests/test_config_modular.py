@@ -24,39 +24,105 @@ def secrets_env() -> AzureSecretsClient:
 # =====================================================================
 
 
+@pytest.fixture
+def minimal_mp_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SQL_CONNECTION_STRING", "Driver=...;")
+    monkeypatch.setenv("MP_CLIENT_ID", "client_xyz")
+    monkeypatch.setenv("MP_CLIENT_SECRET", "secret_xyz")
+    monkeypatch.setenv("MP_WEBHOOK_SECRET", "wh_secret")
+
+
 class TestMpWebhookConfig:
     def test_minimal_env_construye_config(
-        self, secrets_env: AzureSecretsClient, monkeypatch: pytest.MonkeyPatch
+        self, minimal_mp_env: None, secrets_env: AzureSecretsClient
     ) -> None:
-        monkeypatch.setenv("SQL_CONNECTION_STRING", "Driver=...;")
-        monkeypatch.setenv("MP_ACCESS_TOKEN", "APP_USR_xyz")
-        monkeypatch.setenv("MP_WEBHOOK_SECRET", "wh_secret")
-
         cfg = MpWebhookConfig.from_env(secrets=secrets_env)
         assert cfg.sql_connection_string.reveal() == "Driver=...;"
-        assert cfg.mp_access_token.reveal() == "APP_USR_xyz"
+        assert cfg.mp_client_id.reveal() == "client_xyz"
+        assert cfg.mp_client_secret.reveal() == "secret_xyz"
         assert cfg.mp_webhook_secret.reveal() == "wh_secret"
+        # access_token es opcional: por default None (modo OAuth puro).
+        assert cfg.mp_access_token is None
         assert cfg.log_level == "INFO"
+        # Defaults del poller.
+        assert cfg.mp_incremental_lookback_hours == 4
+        assert cfg.mp_initial_load is False
+        assert cfg.mp_initial_lookback_days == 365
+        assert cfg.mp_search_page_delay_ms == 200
+
+    def test_access_token_override_opcional(
+        self,
+        minimal_mp_env: None,
+        secrets_env: AzureSecretsClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """MP_ACCESS_TOKEN es opcional: si está, queda como override; si no, None."""
+        monkeypatch.setenv("MP_ACCESS_TOKEN", "APP_USR_override")
+        cfg = MpWebhookConfig.from_env(secrets=secrets_env)
+        assert cfg.mp_access_token is not None
+        assert cfg.mp_access_token.reveal() == "APP_USR_override"
 
     def test_no_requiere_credenciales_ib(
-        self, secrets_env: AzureSecretsClient, monkeypatch: pytest.MonkeyPatch
+        self, minimal_mp_env: None, secrets_env: AzureSecretsClient
     ) -> None:
         """Sin IB_* en el entorno, MpWebhookConfig.from_env() funciona."""
-        monkeypatch.setenv("SQL_CONNECTION_STRING", "X")
-        monkeypatch.setenv("MP_ACCESS_TOKEN", "Y")
-        monkeypatch.setenv("MP_WEBHOOK_SECRET", "Z")
-        # IB_* deliberadamente ausentes.
         cfg = MpWebhookConfig.from_env(secrets=secrets_env)
         assert isinstance(cfg, MpWebhookConfig)
+
+    def test_client_id_es_obligatorio(
+        self, secrets_env: AzureSecretsClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SQL_CONNECTION_STRING", "X")
+        monkeypatch.setenv("MP_CLIENT_SECRET", "Y")
+        monkeypatch.setenv("MP_WEBHOOK_SECRET", "Z")
+        # MP_CLIENT_ID ausente: debe fallar.
+        with pytest.raises(ConfigError, match="MP_CLIENT_ID"):
+            MpWebhookConfig.from_env(secrets=secrets_env)
+
+    def test_client_secret_es_obligatorio(
+        self, secrets_env: AzureSecretsClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SQL_CONNECTION_STRING", "X")
+        monkeypatch.setenv("MP_CLIENT_ID", "Y")
+        monkeypatch.setenv("MP_WEBHOOK_SECRET", "Z")
+        with pytest.raises(ConfigError, match="MP_CLIENT_SECRET"):
+            MpWebhookConfig.from_env(secrets=secrets_env)
 
     def test_webhook_secret_es_obligatorio(
         self, secrets_env: AzureSecretsClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("SQL_CONNECTION_STRING", "X")
-        monkeypatch.setenv("MP_ACCESS_TOKEN", "Y")
-        # MP_WEBHOOK_SECRET ausente: debe fallar.
+        monkeypatch.setenv("MP_CLIENT_ID", "Y")
+        monkeypatch.setenv("MP_CLIENT_SECRET", "Z")
         with pytest.raises(ConfigError, match="MP_WEBHOOK_SECRET"):
             MpWebhookConfig.from_env(secrets=secrets_env)
+
+    def test_initial_load_parseado_como_bool(
+        self,
+        minimal_mp_env: None,
+        secrets_env: AzureSecretsClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        for truthy in ("true", "True", "1", "yes"):
+            monkeypatch.setenv("MP_INITIAL_LOAD", truthy)
+            cfg = MpWebhookConfig.from_env(secrets=secrets_env)
+            assert cfg.mp_initial_load is True, f"esperaba True para {truthy!r}"
+        for falsy in ("false", "0", "no", ""):
+            monkeypatch.setenv("MP_INITIAL_LOAD", falsy)
+            cfg = MpWebhookConfig.from_env(secrets=secrets_env)
+            assert cfg.mp_initial_load is False, f"esperaba False para {falsy!r}"
+
+    def test_lookback_hours_override(
+        self,
+        minimal_mp_env: None,
+        secrets_env: AzureSecretsClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("MP_INCREMENTAL_LOOKBACK_HOURS", "12")
+        monkeypatch.setenv("MP_SEARCH_PAGE_DELAY_MS", "500")
+        cfg = MpWebhookConfig.from_env(secrets=secrets_env)
+        assert cfg.mp_incremental_lookback_hours == 12
+        assert cfg.mp_search_page_delay_ms == 500
 
     def test_reporta_todas_las_faltantes_juntas(
         self, secrets_env: AzureSecretsClient
@@ -64,19 +130,26 @@ class TestMpWebhookConfig:
         with pytest.raises(ConfigError) as exc_info:
             MpWebhookConfig.from_env(secrets=secrets_env)
         msg = str(exc_info.value)
-        for var in ("SQL_CONNECTION_STRING", "MP_ACCESS_TOKEN", "MP_WEBHOOK_SECRET"):
+        for var in (
+            "SQL_CONNECTION_STRING",
+            "MP_CLIENT_ID",
+            "MP_CLIENT_SECRET",
+            "MP_WEBHOOK_SECRET",
+        ):
             assert var in msg
 
     def test_repr_no_filtra_secretos(
         self, secrets_env: AzureSecretsClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("SQL_CONNECTION_STRING", "supersecret_conn")
-        monkeypatch.setenv("MP_ACCESS_TOKEN", "APP_USR_xyz_real")
+        monkeypatch.setenv("MP_CLIENT_ID", "supersecret_client_id")
+        monkeypatch.setenv("MP_CLIENT_SECRET", "supersecret_client_secret")
         monkeypatch.setenv("MP_WEBHOOK_SECRET", "wh_real_secret")
         cfg = MpWebhookConfig.from_env(secrets=secrets_env)
         rendered = repr(cfg)
         assert "supersecret_conn" not in rendered
-        assert "APP_USR_xyz_real" not in rendered
+        assert "supersecret_client_id" not in rendered
+        assert "supersecret_client_secret" not in rendered
         assert "wh_real_secret" not in rendered
         assert SecretString.PLACEHOLDER in rendered
 

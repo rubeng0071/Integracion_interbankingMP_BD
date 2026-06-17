@@ -11,11 +11,25 @@
     "AZURE_KEY_VAULT_URI": "",
 
     "SQL_CONNECTION_STRING": "DRIVER={ODBC Driver 18 for SQL Server};SERVER=tu-servidor.database.windows.net;DATABASE=finance;UID=finance_svc;PWD=cambiar;Encrypt=yes;TrustServerCertificate=no;",
-    "MP_ACCESS_TOKEN": "APP_USR_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+
+    "_COMMENT_oauth": "OAuth2 client_credentials: el cliente intercambia client_id+client_secret por un access_token via POST /oauth/token y lo refresca antes de expirar.",
+    "MP_CLIENT_ID": "tu_client_id",
+    "MP_CLIENT_SECRET": "tu_client_secret",
+
+    "_COMMENT_override": "OPCIONAL: si MP_ACCESS_TOKEN esta seteado, el cliente lo usa directo y se saltea OAuth. Util para usar APP_USR del panel sin registrar app OAuth.",
+    "MP_ACCESS_TOKEN": "",
+
     "MP_WEBHOOK_SECRET": "cambiar_cuando_se_active_el_webhook",
 
     "_COMMENT_queue": "El handler HTTP encola payment_id; mp_process_payment lo procesa async. AzureWebJobsStorage debe apuntar a un account con tabla y queue. UseDevelopmentStorage=true usa Azurite local; en Azure usar DefaultEndpointsProtocol=... real.",
     "MP_PAYMENT_QUEUE_NAME": "mp-payment-ids",
+
+    "_COMMENT_poller": "mp_poller_run pagina /v1/payments/search cada MP_POLLER_SCHEDULE y encola payment_ids. INCREMENTAL_LOOKBACK_HOURS define la ventana del ciclo. INITIAL_LOAD=true usa INITIAL_LOOKBACK_DAYS para backfill historico.",
+    "MP_POLLER_SCHEDULE": "0 */30 * * * *",
+    "MP_INCREMENTAL_LOOKBACK_HOURS": "4",
+    "MP_INITIAL_LOAD": "false",
+    "MP_INITIAL_LOOKBACK_DAYS": "365",
+    "MP_SEARCH_PAGE_DELAY_MS": "200",
 
     "LOG_LEVEL": "INFO",
 

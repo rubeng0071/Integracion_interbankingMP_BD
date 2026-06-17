@@ -209,16 +209,32 @@ class AppConfig:
 
 @dataclass
 class MpWebhookConfig:
-    """Configuración mínima para mp_webhook_function.
+    """Configuración mínima para mp_webhook_function (webhook + worker + poller).
 
-    A diferencia de AppConfig, MP_WEBHOOK_SECRET es OBLIGATORIO: sin él
-    no podemos validar HMAC, y la política es rechazar webhooks sin firma.
-    Forzarlo en la config saca el check tardío del handler HTTP.
+    Auth MP usa OAuth2 client_credentials por default: `mp_client_id` y
+    `mp_client_secret` son OBLIGATORIOS. El cliente HTTP los intercambia por
+    un access_token vía POST /oauth/token y lo refresca antes de expirar.
+
+    `mp_access_token` queda como OVERRIDE OPCIONAL para dev local: si está
+    presente, el cliente lo usa directo y se saltea el OAuth flow. Pensado para
+    usar APP_USR del panel sin registrar una app OAuth.
+
+    `mp_webhook_secret` también es OBLIGATORIO: sin él no podemos validar HMAC
+    del webhook, y la política es rechazar entradas sin firma.
+
+    Settings del poller (`mp_poller_*`) son opcionales con defaults razonables.
     """
 
     sql_connection_string: SecretString
-    mp_access_token: SecretString
+    mp_client_id: SecretString
+    mp_client_secret: SecretString
     mp_webhook_secret: SecretString
+    mp_access_token: Optional[SecretString] = None  # Override para dev local; opcional en prod.
+    # Poller (mp_poller_run): batch incremental que pagina /v1/payments/search.
+    mp_incremental_lookback_hours: int = 4
+    mp_initial_load: bool = False
+    mp_initial_lookback_days: int = 365
+    mp_search_page_delay_ms: int = 200
     log_level: str = "INFO"
     azure_key_vault_uri: Optional[str] = None
     application_insights_connection_string: Optional[SecretString] = None
@@ -229,13 +245,26 @@ class MpWebhookConfig:
     def from_env(cls, secrets: Optional[AzureSecretsClient] = None) -> "MpWebhookConfig":
         v = _Validator(secrets or default_secrets_client())
         sql = v.required_secret("SQL_CONNECTION_STRING")
-        mp_token = v.required_secret("MP_ACCESS_TOKEN")
+        client_id = v.required_secret("MP_CLIENT_ID")
+        client_secret = v.required_secret("MP_CLIENT_SECRET")
         webhook_secret = v.required_secret("MP_WEBHOOK_SECRET")
+
+        lookback_hours = v.int_env("MP_INCREMENTAL_LOOKBACK_HOURS", cls.mp_incremental_lookback_hours)
+        initial_lookback_days = v.int_env("MP_INITIAL_LOOKBACK_DAYS", cls.mp_initial_lookback_days)
+        page_delay_ms = v.int_env("MP_SEARCH_PAGE_DELAY_MS", cls.mp_search_page_delay_ms)
+        initial_load = (os.getenv("MP_INITIAL_LOAD") or "").strip().lower() in ("1", "true", "yes")
+
         v.raise_if_errors()
         return cls(
             sql_connection_string=sql,                  # type: ignore[arg-type]
-            mp_access_token=mp_token,                   # type: ignore[arg-type]
+            mp_client_id=client_id,                     # type: ignore[arg-type]
+            mp_client_secret=client_secret,             # type: ignore[arg-type]
             mp_webhook_secret=webhook_secret,           # type: ignore[arg-type]
+            mp_access_token=v.optional_secret("MP_ACCESS_TOKEN"),
+            mp_incremental_lookback_hours=lookback_hours,
+            mp_initial_load=initial_load,
+            mp_initial_lookback_days=initial_lookback_days,
+            mp_search_page_delay_ms=page_delay_ms,
             log_level=os.getenv("LOG_LEVEL", cls.log_level),
             azure_key_vault_uri=os.getenv("AZURE_KEY_VAULT_URI"),
             application_insights_connection_string=v.optional_secret(

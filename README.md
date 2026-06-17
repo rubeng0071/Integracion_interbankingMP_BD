@@ -28,8 +28,13 @@ contable.
        │   ├─ encola payment_id │   │   ├─ balances           │
        │   └─ 202 Accepted      │   │   ├─ movements (bulk)   │
        │                        │   │   ├─ transfers          │
-       │  Queue worker          │   │   ├─ vouchers           │
-       │   ├─ GET MP API        │   │   └─ extracts (bulk)    │
+       │  Timer */30 min        │   │   ├─ vouchers           │
+       │   ├─ search paginado   │   │   └─ extracts (bulk)    │
+       │   └─ encola IDs        │   │                         │
+       │                        │   │                         │
+       │  Queue worker          │   │                         │
+       │   ├─ OAuth /oauth/token│   │                         │
+       │   ├─ GET MP API        │   │                         │
        │   └─ UPSERT idempotent │   │                         │
        └──────────┬─────────────┘   └────────────┬────────────┘
                   │                              │
@@ -50,7 +55,10 @@ contable.
 | Decisión | Por qué |
 |---|---|
 | Dos Function Apps separadas | Blast radius, escalado independiente, RBAC granular. |
+| Webhook + Poller MP en la misma App | Comparten cliente OAuth, config y queue. El poller solo encola IDs y reusa el worker existente — cero código duplicado. |
 | Webhook async via Queue | Blinda SLA de 2s del HTTP; el upsert puede tardar lo que necesite. |
+| Poller MP como red de seguridad | Cada 30 min recorre la ventana reciente. Cubre webhooks perdidos / downtime de MP / carga histórica inicial. Idempotente por `date_last_updated`. |
+| OAuth client_credentials con cache | Token MP de 6h, refrescado al 80% del expires_in. Lock para concurrencia. Override opcional para dev local con APP_USR. |
 | Linux Consumption Plan | Costo bajo, escalado automático. Cold start aceptable (1.5-3s). |
 | Key Vault con Managed Identity | Sin credenciales en disco, rotación sin redeploy. |
 | Bulk upsert (staging + MERGE) | Movements/extracts row-by-row eran el cuello de botella. |
@@ -130,11 +138,11 @@ servicio_interbankingMP_toBD/
 │   ├── interbanking_client.py             cliente IB (lazy import pandas)
 │   └── observability.py                   OPS-01 logging JSON + AppInsights
 │
-├── mp_webhook_function/                   Azure Function HTTP + Queue worker
-│   ├── function_app.py                    AZ-02 HMAC + AZ-03 idempotencia
-│   ├── mp_client.py                       cliente MP con SecretString
+├── mp_webhook_function/                   Function MP (HTTP + Queue worker + Timer poller)
+│   ├── function_app.py                    mp_webhook (HMAC), mp_process_payment (worker), mp_poller_run (timer)
+│   ├── mp_client.py                       cliente MP con OAuth2 client_credentials
 │   ├── mp_processor.py                    transform + upsert (CAL-02)
-│   ├── host.json                          timeout + retries + sampling
+│   ├── host.json                          timeout 10min + singleton + retries
 │   └── requirements.txt
 │
 ├── ib_poller/                             Azure Function Timer
@@ -237,9 +245,10 @@ pytest --cov=shared                 # con coverage
 pytest --cov=shared --cov-report=html  # HTML en htmlcov/
 ```
 
-Coverage actual de `shared/`: ~95%. Las Functions individuales tienen
-cobertura indirecta vía los tests de sus dependencias (`shared/`,
-`Database`).
+Coverage actual de `shared/`: ~95%. Las Functions tienen tests dedicados:
+`test_mp_client.py` (OAuth flow + 401 retry + search params),
+`test_mp_poller.py` (paginación + dedup + corte por max_pages),
+`test_database_pool.py`, `test_interbanking_client.py`.
 
 ## Deploy a Azure
 

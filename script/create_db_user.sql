@@ -58,7 +58,11 @@ GRANT EXECUTE ON SCHEMA::finance TO finance_svc;
 -- GRANT ALTER ON SCHEMA::finance TO finance_svc;
 
 /* --------- 4) Denegar explícitamente lo peligroso --------- */
-DENY ALTER, CONTROL, REFERENCES ON SCHEMA::finance TO finance_svc;
+-- NOTA: DENY CONTROL es meta-permiso (incluye SELECT/INSERT/UPDATE/DELETE).
+-- Si lo agregás aquí, el GRANT SELECT/INSERT/UPDATE/DELETE del paso 3
+-- queda anulado y `finance_svc` no puede leer ni escribir nada.
+-- Para bloquear solo cambios estructurales, dejá únicamente ALTER y REFERENCES.
+DENY ALTER, REFERENCES ON SCHEMA::finance TO finance_svc;
 
 -- Bloquear acceso a metadata sensible (Azure SQL ya lo restringe, pero por las dudas).
 DENY VIEW SERVER STATE TO finance_svc;

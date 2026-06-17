@@ -45,8 +45,12 @@ Write-Step "$EnvFile parseado: $($envVars.Count) variables"
 # ---------------------------------------------------------------------
 
 # Estos van a Key Vault (con conversion _ -> -).
+# MP_CLIENT_ID/MP_CLIENT_SECRET son obligatorios en prod (OAuth2 client_credentials).
+# MP_ACCESS_TOKEN queda como OVERRIDE OPCIONAL para dev local; en prod se ignora.
 $secretVars = @(
     "SQL_CONNECTION_STRING",
+    "MP_CLIENT_ID",
+    "MP_CLIENT_SECRET",
     "MP_ACCESS_TOKEN",
     "MP_WEBHOOK_SECRET",
     "IB_CLIENT_ID",
@@ -82,7 +86,11 @@ foreach ($name in $secretVars) {
         continue
     }
     $value = $envVars[$name]
-    if (-not $value -or $value -match '^cambiar|^TODO|^tu_') {
+    # Patrones de placeholder a saltar:
+    #   ^cambiar / ^TODO / ^tu_  (del .env.example original)
+    #   ^<COMPLETAR  / contiene <COMPLETAR_ (placeholders del .env generado)
+    #   ^<*>$  (cualquier <...> sin contenido real)
+    if (-not $value -or $value -match '^cambiar|^TODO|^tu_|<COMPLETAR') {
         Write-Host "    -- $name parece placeholder; saltando" -ForegroundColor DarkGray
         continue
     }

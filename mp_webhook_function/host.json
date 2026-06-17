@@ -14,13 +14,29 @@
       "Function": "Information"
     }
   },
-  "functionTimeout": "00:05:00",
+  "_comment_timeout": "El webhook responde en <200ms pero mp_poller_run pagina 200 paginas con 200ms entre cada una -> hasta ~40s + GETs. El worker mp_process_payment puede tardar segundos. 10 min cubre todos.",
+  "functionTimeout": "00:10:00",
   "extensions": {
     "http": {
       "routePrefix": "api",
       "maxConcurrentRequests": 50,
       "maxOutstandingRequests": 200
+    },
+    "queues": {
+      "_comment": "Concurrencia del worker: hasta 16 mensajes en paralelo por host. MP API tolera ~10 req/s asi que estamos en margen.",
+      "batchSize": 16,
+      "newBatchThreshold": 8,
+      "maxDequeueCount": 5,
+      "visibilityTimeout": "00:01:00"
     }
+  },
+  "_comment_singleton": "Solo aplica al timer mp_poller_run: no queremos dos polls solapados encolando los mismos IDs.",
+  "singleton": {
+    "lockPeriod": "00:00:15",
+    "listenerLockPeriod": "00:01:00",
+    "listenerLockRecoveryPollingInterval": "00:01:00",
+    "lockAcquisitionTimeout": "00:01:00",
+    "lockAcquisitionPollingInterval": "00:00:03"
   },
   "retry": {
     "strategy": "exponentialBackoff",

@@ -1,9 +1,18 @@
 # =====================================================================
-# SQL Server + Database serverless + AAD admin + firewall rules.
+# SQL Server + Database serverless + firewall rules.
 #
-# Decision: SKU serverless General Purpose Gen5_2. Pausa automatica
-# despues de 1 hora idle. Perfecto para nuestro patron de carga
-# (webhook eventual + poller cada 10 min, mucho idle por la noche).
+# Soporta DOS escenarios:
+#   A. SQL Server NUEVO: si no existe, lo crea (pide password admin).
+#   B. SQL Server EXISTENTE: si ya existe, lo respeta y solo crea la DB +
+#      agrega firewall rules + guarda la conn string en Key Vault.
+#
+# Para usar un server existente, exportar antes:
+#     $env:SqlServer = "nombre-corto-del-server"           # SIN .database.windows.net
+#     $env:SqlServerResourceGroup = "rg-del-server"        # opcional, si vive en otro RG
+#     $env:SqlAdminUser = "rapanuisa"                      # default 'sqladmin'
+#
+# Decision: si lo creamos nosotros, SKU serverless General Purpose Gen5_2.
+# Pausa automatica despues de 1 hora idle.
 # =====================================================================
 [CmdletBinding()]
 param(
@@ -13,40 +22,58 @@ $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\_config.ps1"
 Assert-AzReady
 
-# Admin SQL (login + password). Lo guardamos en Key Vault al final.
-$sqlAdminUser = "sqladmin"
+# ---------- Determinar si el server existe ----------
+# Se busca primero en SqlServerResourceGroup (puede ser distinto al RG nuestro).
+Write-Step "Buscando SQL Server '$SqlServer' en RG '$SqlServerResourceGroup'"
+$srvId = az sql server show `
+    --name $SqlServer --resource-group $SqlServerResourceGroup `
+    --query "id" -o tsv 2>$null
 
+$serverIsNew = $false
+if (-not $srvId) {
+    Write-Host "    No existe; lo vamos a crear en $ResourceGroup" -ForegroundColor Yellow
+    $serverIsNew = $true
+    # Cuando lo creamos nosotros, el server vive en NUESTRO RG.
+    $SqlServerResourceGroup = $ResourceGroup
+} else {
+    Write-Skip "$SqlServer (existente en $SqlServerResourceGroup)"
+}
+
+# ---------- Password admin ----------
+# Solo necesario si vamos a crear el server (CREATE SERVER pide --admin-password).
+# Si el server existe, no la usamos para crear, pero la necesitamos abajo
+# para componer la conn string que persistimos temporalmente en KV.
 if (-not $SqlAdminPassword) {
-    Write-Step "Pedir password para el admin SQL (sqladmin)"
-    $SqlAdminPassword = Read-Host -AsSecureString "Password (min 16 chars, mayus+minus+digitos+simbolos)"
+    if ($serverIsNew) {
+        Write-Step "Password para el admin SQL ($SqlAdminUser)"
+        $SqlAdminPassword = Read-Host -AsSecureString "Password (min 16 chars, mayus+minus+digitos+simbolos)"
+    } else {
+        Write-Step "Password del admin existente ($SqlAdminUser) para la conn string inicial"
+        $SqlAdminPassword = Read-Host -AsSecureString "Password de $SqlAdminUser en $SqlServer"
+    }
 }
 $plainPwd = [System.Net.NetworkCredential]::new("", $SqlAdminPassword).Password
-if ($plainPwd.Length -lt 12) {
-    Fail "Password muy corto. SQL Server exige >= 8; recomendamos 16+."
+if ($plainPwd.Length -lt 8) {
+    Fail "Password muy corto (Azure SQL exige >= 8; recomendamos 16+)."
 }
 
-# ---------- SQL Server logico ----------
-Write-Step "SQL Server: $SqlServer"
-$srvId = az sql server show `
-    --name $SqlServer --resource-group $ResourceGroup `
-    --query "id" -o tsv 2>$null
-if (-not $srvId) {
+# ---------- Crear server si era nuevo ----------
+if ($serverIsNew) {
+    Write-Step "Creando SQL Server: $SqlServer"
     az sql server create `
-        --name $SqlServer --resource-group $ResourceGroup `
+        --name $SqlServer --resource-group $SqlServerResourceGroup `
         --location $Location `
-        --admin-user $sqlAdminUser --admin-password $plainPwd `
+        --admin-user $SqlAdminUser --admin-password $plainPwd `
         --minimal-tls-version "1.2" `
         --output none
     Write-Ok "Creado"
-} else {
-    Write-Skip $SqlServer
 }
 
 # ---------- AAD admin (opcional pero recomendado) ----------
 if ($SqlAadAdmin) {
     Write-Step "AAD admin SQL: $SqlAadAdmin"
     az sql server ad-admin create `
-        --server $SqlServer --resource-group $ResourceGroup `
+        --server $SqlServer --resource-group $SqlServerResourceGroup `
         --display-name $SqlAadAdmin --object-id (
             az ad user show --id $SqlAadAdmin --query "id" -o tsv 2>$null
         ) --output none 2>$null
@@ -60,18 +87,17 @@ if ($SqlAadAdmin) {
 }
 
 # ---------- Firewall: permitir Azure Services ----------
-# Necesario para que las Function Apps (que tienen IPs dinamicas en
-# Consumption Plan) lleguen a SQL. La regla "AllowAllWindowsAzureIps"
-# (start=0.0.0.0, end=0.0.0.0) permite cualquier recurso Azure dentro
-# de cualquier tenant. Si querés mas seguridad: migrar a Private Endpoint
-# o restringir por outbound IPs de la Function App.
+# Necesario para que las Function Apps (Consumption Plan, IPs dinamicas) lleguen
+# a SQL. La regla "AllowAllWindowsAzureIps" (start=0.0.0.0, end=0.0.0.0) permite
+# cualquier recurso Azure dentro de cualquier tenant. Si querés mas seguridad:
+# migrar a Private Endpoint o restringir por outbound IPs de las Function Apps.
 Write-Step "Firewall: permitir servicios Azure"
 $ruleExists = az sql server firewall-rule show `
-    --server $SqlServer --resource-group $ResourceGroup `
+    --server $SqlServer --resource-group $SqlServerResourceGroup `
     --name "AllowAzureServices" --query "id" -o tsv 2>$null
 if (-not $ruleExists) {
     az sql server firewall-rule create `
-        --server $SqlServer --resource-group $ResourceGroup `
+        --server $SqlServer --resource-group $SqlServerResourceGroup `
         --name "AllowAzureServices" `
         --start-ip-address 0.0.0.0 --end-ip-address 0.0.0.0 `
         --output none
@@ -86,11 +112,11 @@ if ($myIp) {
     Write-Step "Firewall: agregar tu IP ($myIp) para sqlcmd local"
     $ruleName = "client-$($myIp.Replace('.','-'))"
     $exists = az sql server firewall-rule show `
-        --server $SqlServer --resource-group $ResourceGroup `
+        --server $SqlServer --resource-group $SqlServerResourceGroup `
         --name $ruleName --query "id" -o tsv 2>$null
     if (-not $exists) {
         az sql server firewall-rule create `
-            --server $SqlServer --resource-group $ResourceGroup `
+            --server $SqlServer --resource-group $SqlServerResourceGroup `
             --name $ruleName `
             --start-ip-address $myIp --end-ip-address $myIp `
             --output none
@@ -103,11 +129,11 @@ if ($myIp) {
 # ---------- Database serverless ----------
 Write-Step "Database: $SqlDatabase (serverless Gen5_2)"
 $dbId = az sql db show `
-    --name $SqlDatabase --server $SqlServer --resource-group $ResourceGroup `
+    --name $SqlDatabase --server $SqlServer --resource-group $SqlServerResourceGroup `
     --query "id" -o tsv 2>$null
 if (-not $dbId) {
     az sql db create `
-        --name $SqlDatabase --server $SqlServer --resource-group $ResourceGroup `
+        --name $SqlDatabase --server $SqlServer --resource-group $SqlServerResourceGroup `
         --edition GeneralPurpose --family Gen5 --capacity 2 --compute-model Serverless `
         --auto-pause-delay 60 `
         --backup-storage-redundancy Local `
@@ -118,29 +144,29 @@ if (-not $dbId) {
 }
 
 # ---------- Connection string (lo guardamos en Key Vault) ----------
-# El user finance_svc se crea aparte con `create_db_user.sql`. Acá la
-# conn string usa al admin para el bootstrap inicial; despues de aplicar
-# create_db_user.sql, conviene rotar a finance_svc.
-$connString = "DRIVER={ODBC Driver 18 for SQL Server};SERVER=tcp:$SqlServer.database.windows.net,1433;DATABASE=$SqlDatabase;UID=$sqlAdminUser;PWD=$plainPwd;Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+# Inicial: usa el admin para que sqlcmd pueda aplicar los SQL del paso 4.
+# Despues de crear finance_svc con create_db_user.sql, rotamos manualmente
+# (ver docs/DEPLOY.md seccion 4.4).
+$connString = "DRIVER={ODBC Driver 18 for SQL Server};SERVER=tcp:$SqlServer.database.windows.net,1433;DATABASE=$SqlDatabase;UID=$SqlAdminUser;PWD=$plainPwd;Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
 
 Write-Step "Guardando connection string en Key Vault"
 $existing = az keyvault secret show --vault-name $KeyVault `
     --name "SQL-CONNECTION-STRING" --query "id" -o tsv 2>$null
 if ($existing) {
-    Write-Skip "SQL-CONNECTION-STRING ya existe; usar 50-load-secrets.ps1 para rotar"
+    Write-Skip "SQL-CONNECTION-STRING ya existe; usar 50-load-secrets.ps1 -Force para rotar"
 } else {
     az keyvault secret set --vault-name $KeyVault `
         --name "SQL-CONNECTION-STRING" --value $connString `
         --output none
-    Write-Ok "Cargada en KV (usa user 'sqladmin' temporalmente)"
+    Write-Ok "Cargada en KV (usa user '$SqlAdminUser' temporalmente)"
 }
 
 # ---------- Recordatorio ----------
 Write-Host ""
 Write-Host "SQL OK. Después corré los scripts de esquema:" -ForegroundColor Green
-Write-Host "  sqlcmd -S $SqlServer.database.windows.net -d $SqlDatabase -U $sqlAdminUser -P '...' -i ..\script\unified_finance_schema.sql"
-Write-Host "  sqlcmd -S $SqlServer.database.windows.net -d $SqlDatabase -U $sqlAdminUser -P '...' -i ..\script\create_db_user.sql"
-Write-Host "  sqlcmd -S $SqlServer.database.windows.net -d $SqlDatabase -U $sqlAdminUser -P '...' -i ..\script\unified_finance_schema_security_v2.sql"
+Write-Host "  sqlcmd -S $SqlServer.database.windows.net -d $SqlDatabase -U $SqlAdminUser -P '...' -i ..\script\unified_finance_schema.sql"
+Write-Host "  sqlcmd -S $SqlServer.database.windows.net -d $SqlDatabase -U $SqlAdminUser -P '...' -i ..\script\create_db_user.sql"
+Write-Host "  sqlcmd -S $SqlServer.database.windows.net -d $SqlDatabase -U $SqlAdminUser -P '...' -i ..\script\unified_finance_schema_security_v2.sql"
 Write-Host ""
 Write-Host "Y editá create_db_user.sql para reemplazar el password placeholder antes de correrlo." -ForegroundColor Yellow
 Write-Host ""

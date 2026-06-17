@@ -12,6 +12,12 @@
 secrets/
 local.settings.json
 
+# Scripts SQL con secretos resueltos (los .sql del repo tienen placeholders).
+# Convención: si necesitas correr un .sql con la password real, copialo a
+# create_db_user.local.sql y editá ahí; ese archivo NO se commitea.
+script/*.local.sql
+script/.local/
+
 # =====================================================================
 # Python
 # =====================================================================
@@ -32,10 +38,20 @@ parts/
 sdist/
 var/
 wheels/
+# Wheels de build local (shared/). Se generan con build_shared_wheel.ps1 y se
+# copian a mp_webhook_function/ e ib_poller/; no se commitean (CLAUDE.md).
+*.whl
 *.egg-info/
 .installed.cfg
 *.egg
 MANIFEST
+
+# Artefacto local de herramienta (vector store); no es del proyecto.
+ruvector.db
+
+# Material de referencia / extractos bancarios (pesado y sensible, 200MB+).
+# No va al repo; vive solo local.
+Doc/
 
 # Entornos virtuales
 .venv/

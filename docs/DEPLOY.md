@@ -36,10 +36,14 @@ para detalle de fondo.
 - **Tenant Azure AD**: el usuario que corre los scripts debe poder
   consultar `az ad signed-in-user show` (la mayoría de los users sí
   pueden). El AAD admin de SQL es opcional pero recomendado.
-- **Credenciales Mercado Pago**:
-  - `MP_ACCESS_TOKEN` (panel MP → Tus integraciones → Credenciales).
+- **Credenciales Mercado Pago** (OAuth2 client_credentials):
+  - `MP_CLIENT_ID` y `MP_CLIENT_SECRET` (panel MP → Tus integraciones → tu
+    app → Credenciales). El cliente HTTP los intercambia por un access_token
+    vía POST `/oauth/token` y lo refresca al 80% del `expires_in` (6h).
   - `MP_WEBHOOK_SECRET` (panel MP → Webhooks → Configurar
     notificaciones; se muestra **una sola vez** al crear el webhook).
+  - `MP_ACCESS_TOKEN` (opcional): override para dev local con tokens APP_USR
+    estáticos. En prod dejarlo vacío.
 - **Credenciales Interbanking**:
   - `IB_CLIENT_ID`, `IB_CLIENT_SECRET` (developers.interbanking.com.ar).
   - `IB_SERVICE_URL` (URL de redirección OAuth registrada).
@@ -103,8 +107,10 @@ Completá **todos** los valores reales (sin placeholders `cambiar`, `tu_`,
 
 ```
 SQL_CONNECTION_STRING=...              # opcional aquí; lo carga 20-create-sql
-MP_ACCESS_TOKEN=APP_USR_xxx
+MP_CLIENT_ID=xxx                       # OAuth2: panel MP → app → Credenciales
+MP_CLIENT_SECRET=xxx                   # OAuth2: ídem
 MP_WEBHOOK_SECRET=xxx                  # del panel MP
+# MP_ACCESS_TOKEN=APP_USR_xxx          # opcional, solo dev local
 IB_CLIENT_ID=xxx
 IB_CLIENT_SECRET=xxx
 IB_SERVICE_URL=https://tu-empresa.com.ar/callback
@@ -330,10 +336,12 @@ Output esperado:
 ```
 ==> .env parseado: 15 variables
 ==> Cargando secretos en Key Vault
-    OK MP-ACCESS-TOKEN
+    OK MP-CLIENT-ID
+    OK MP-CLIENT-SECRET
     OK MP-WEBHOOK-SECRET
     OK IB-CLIENT-ID
     OK IB-CLIENT-SECRET
+    -- MP-ACCESS-TOKEN no esta en .env; saltando   (override opcional para dev)
     -- SQL-CONNECTION-STRING ya está en KV (usa -Force para sobrescribir)
 ==> App Settings -> func-ib-poller-prod (5 vars)
     OK Aplicado
@@ -364,7 +372,7 @@ Verificación de que cada Function ve sus funciones:
 
 ```powershell
 az functionapp function list --name func-mp-webhook-prod --resource-group rg-finance-sync-prod --query "[].name" -o tsv
-# Debe imprimir: mp_webhook  mp_process_payment
+# Debe imprimir: mp_webhook  mp_process_payment  mp_poller_run
 
 az functionapp function list --name func-ib-poller-prod --resource-group rg-finance-sync-prod --query "[].name" -o tsv
 # Debe imprimir: ib_poller_run
@@ -402,6 +410,37 @@ Después de unos segundos, verificá que se procesó:
 sqlcmd -S sql-finance-sync-prod.database.windows.net -d finance -U finance_svc -P '...' `
     -Q "SELECT TOP 1 payment_id, status, date_last_updated FROM finance.mp_payments ORDER BY date_last_updated DESC"
 ```
+
+### 6.3a Function MP — backfill histórico (OPCIONAL, una vez)
+
+Si querés disparar la carga histórica de los últimos 365 días sin esperar al
+primer ciclo del poller, activá temporalmente el modo `INITIAL_LOAD`:
+
+```powershell
+az functionapp config appsettings set `
+    --name func-mp-webhook-prod --resource-group rg-finance-sync-prod `
+    --settings "MP_INITIAL_LOAD=true" "MP_INITIAL_LOOKBACK_DAYS=365" `
+    --output none
+
+# Forzar la primera ejecución del timer (no esperar al cron):
+$subId = az account show --query id -o tsv
+az rest --method post `
+    --url "https://management.azure.com/subscriptions/$subId/resourceGroups/rg-finance-sync-prod/providers/Microsoft.Web/sites/func-mp-webhook-prod/functions/mp_poller_run/invoke?api-version=2022-03-01"
+
+# Esperar ~5-10 minutos para que pagine todo. Verificar:
+sqlcmd -S sql-finance-sync-prod.database.windows.net -d finance -U finance_svc -P '...' `
+    -Q "SELECT COUNT(*) AS pagos_cargados FROM finance.mp_payments"
+
+# Apagar INITIAL_LOAD para que los ciclos siguientes vuelvan a la ventana incremental:
+az functionapp config appsettings set `
+    --name func-mp-webhook-prod --resource-group rg-finance-sync-prod `
+    --settings "MP_INITIAL_LOAD=false" `
+    --output none
+```
+
+> Si dejás `MP_INITIAL_LOAD=true` por error, cada ciclo de 30 min vuelve a
+> paginar 365 días. No rompe nada (idempotencia vía `_is_already_current`)
+> pero quema rate limit y prendido alertas de queue backlog.
 
 ### 6.3 Function IB ejecuta el cron
 
@@ -505,9 +544,11 @@ az keyvault secret list --vault-name kv-finance-sync-prod --query "[].name" -o t
 #   APPLICATIONINSIGHTS-CONNECTION-STRING (opcional, si lo cargaste)
 #   IB-CLIENT-ID
 #   IB-CLIENT-SECRET
-#   MP-ACCESS-TOKEN
+#   MP-CLIENT-ID
+#   MP-CLIENT-SECRET
 #   MP-WEBHOOK-SECRET
 #   SQL-CONNECTION-STRING
+#   (MP-ACCESS-TOKEN solo si lo cargaste como override para dev)
 
 # 4. Schema SQL completo
 sqlcmd -S sql-finance-sync-prod.database.windows.net -d finance -U finance_svc -P '...' `
