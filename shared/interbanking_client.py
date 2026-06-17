@@ -709,15 +709,39 @@ class InterbankingClient:
     # account-type, currency.
     # ------------------------------------------------------------------
 
+    def _invalidate_token(self) -> None:
+        """Fuerza un refresh del token en el próximo request.
+
+        IB invalida el access_token de forma intermitente durante paginación
+        profunda (se observaron 401 en /movements/anteriores?page=20 a mitad
+        de un ciclo). Limpiamos el cache para que _api_headers() pida uno nuevo.
+        """
+        self._access_token = None
+        self._token_expires_at = None
+
+    def _authed_get(self, url: str, params: Optional[Dict[str, Any]]) -> Any:
+        """GET autenticado con retry único ante 401 (refresca token y reintenta).
+
+        El 401 de IB no está en el status_forcelist del Retry de urllib3 (que
+        cubre 429/5xx), así que lo manejamos acá: ante 401, invalidamos el
+        token, pedimos uno nuevo y reintentamos una sola vez. Si vuelve a
+        fallar, propaga. Devuelve el Response ya con raise_for_status aplicado.
+        """
+        response = self.session.get(url, headers=self._api_headers(), params=params, timeout=self.timeout)
+        if response.status_code == 401:
+            logger.warning("IB respondió 401 en %s; refrescando token y reintentando una vez", url)
+            self._invalidate_token()
+            response = self.session.get(url, headers=self._api_headers(), params=params, timeout=self.timeout)
+        response.raise_for_status()
+        return response
+
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         url = f"{self.api_base_url}{path}"
         merged_params: Dict[str, Any] = {"customer-id": self.customer_id}
         if params:
             merged_params.update(params)
         logger.debug("GET %s params=%s", url, merged_params)
-        response = self.session.get(url, headers=self._api_headers(), params=merged_params, timeout=self.timeout)
-        response.raise_for_status()
-        return response.json()
+        return self._authed_get(url, merged_params).json()
 
     def _get_paginated(self, path: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """Itera páginas y devuelve todos los registros concatenados.
@@ -921,8 +945,10 @@ class InterbankingClient:
         }
         # 'dia' es solo el día actual; las otras opciones aceptan ventana de fechas.
         if movement_type != "dia":
-            if date_since: params["date-since"] = date_since
-            if date_until: params["date-until"] = date_until
+            if date_since:
+                params["date-since"] = date_since
+            if date_until:
+                params["date-until"] = date_until
 
         # Iteramos paginación manual porque _get_paginated usa _get que asume path
         # relativo a self.api_base_url. Aquí pegamos contra full_url custom.
@@ -931,9 +957,7 @@ class InterbankingClient:
         while True:
             params["page"] = page
             logger.debug("GET %s params=%s", full_url, params)
-            response = self.session.get(full_url, headers=self._api_headers(), params=params, timeout=self.timeout)
-            response.raise_for_status()
-            raw = response.json()
+            raw = self._authed_get(full_url, params).json()
             records = self._extract_records(raw)
             if not records:
                 break

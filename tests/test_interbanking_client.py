@@ -369,3 +369,61 @@ class TestMovementInjection:
         row = df.iloc[0].to_dict()
         assert row["source_account"] == "999"
         assert row["grouping_code_ib"] == "8 1 1"
+
+
+class TestAuthRetry401:
+    """IB invalida el token intermitentemente en paginación profunda (401 a
+    mitad de un ciclo). _authed_get refresca el token y reintenta una vez."""
+
+    class _Resp:
+        def __init__(self, code: int, payload: dict | None = None) -> None:
+            self.status_code = code
+            self._payload = payload if payload is not None else {}
+
+        def json(self) -> dict:
+            return self._payload
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                import requests
+                raise requests.HTTPError(str(self.status_code))
+
+    class _FakeSession:
+        def __init__(self, responses: list) -> None:
+            self._responses = list(responses)
+            self.calls: list = []
+
+        def get(self, url, headers=None, params=None, timeout=None):
+            self.calls.append((url, dict(params or {})))
+            return self._responses.pop(0)
+
+    def _client(self, responses: list) -> InterbankingClient:
+        c = _build()
+        c._get_token = lambda: "tok"  # type: ignore[method-assign]
+        c._access_token = SecretString("tok")
+        c.session = self._FakeSession(responses)  # type: ignore[assignment]
+        return c
+
+    def test_401_refresca_token_y_reintenta(self) -> None:
+        c = self._client([self._Resp(401), self._Resp(200, {"ok": True})])
+        out = c._authed_get("https://ib/api", {"page": 0})
+        assert out.json() == {"ok": True}
+        assert len(c.session.calls) == 2          # reintentó una vez
+        assert c._access_token is None            # invalidó el token cacheado
+
+    def test_sin_401_no_invalida_token(self) -> None:
+        tok = SecretString("tok")
+        c = _build()
+        c._get_token = lambda: "tok"  # type: ignore[method-assign]
+        c._access_token = tok
+        c.session = self._FakeSession([self._Resp(200, {"ok": 1})])  # type: ignore[assignment]
+        c._authed_get("https://ib/api", None)
+        assert len(c.session.calls) == 1
+        assert c._access_token is tok             # token intacto
+
+    def test_401_persistente_propaga(self) -> None:
+        import requests
+        c = self._client([self._Resp(401), self._Resp(401)])
+        with pytest.raises(requests.HTTPError):
+            c._authed_get("https://ib/api", None)
+        assert len(c.session.calls) == 2          # un solo reintento, luego propaga
