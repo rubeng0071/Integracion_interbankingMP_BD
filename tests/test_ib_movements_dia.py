@@ -112,6 +112,25 @@ def test_dia_hash_no_colisiona_con_anteriores(proc: IBProcessor) -> None:
     assert ant["movement_hash"] != dia["movement_hash"]
 
 
+def test_dia_idem_distinto_seq_no_colapsan(proc: IBProcessor) -> None:
+    # Dos movimientos del día IDÉNTICOS en todos los campos (IB no asigna
+    # voucher/correlative) deben dar hashes DISTINTOS según su seq de
+    # desempate -> no se pierden ni rompen la PK de la temp de limpieza.
+    base = {
+        "source_account": "2580096723", "voucher_number": "0",
+        "process_date": "2026-06-18T10:00:00", "amount": 7922.56,
+        "debit_credit_type": "C", "operation_code_ib": "144",
+        "branch_office_activity": None, "correlative_number": None,
+        "movement_date": None,
+    }
+    h0 = proc._build_movement_row(pd.Series(base), _acc(), "dia", 0)["movement_hash"]
+    h1 = proc._build_movement_row(pd.Series(base), _acc(), "dia", 1)["movement_hash"]
+    assert h0 != h1
+    # pero el MISMO seq (mismo movimiento entre ciclos) -> mismo hash
+    h0b = proc._build_movement_row(pd.Series(base), _acc(), "dia", 0)["movement_hash"]
+    assert h0 == h0b
+
+
 def test_dia_distintos_movimientos_distinto_hash(proc: IBProcessor) -> None:
     # Dos movimientos del día que difieren en importe deben tener hash distinto
     # (no colapsan), aunque ya no haya índice de lote.

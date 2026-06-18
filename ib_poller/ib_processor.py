@@ -466,24 +466,34 @@ class IBProcessor:
         return SyncStats(process, counter["read"], counter["upserted"],
                          int((_utcnow_naive() - started).total_seconds() * 1000))
 
+    @staticmethod
+    def _dia_group_key(r: Dict[str, Any]) -> tuple:
+        """Campos que definen un movimiento 'dia' (sin el seq de desempate)."""
+        return (
+            r.get("source_account"), r.get("process_date"), r.get("amount"),
+            r.get("debit_credit_type"), r.get("operation_code_ib"),
+            r.get("branch_office_activity"), r.get("voucher_number"),
+            r.get("correlative_number"),
+        )
+
     def _build_movement_row(
-        self, row: "pd.Series", acc: "pd.Series", feed: str
+        self, row: "pd.Series", acc: "pd.Series", feed: str, seq: int = 0
     ) -> Dict[str, Any]:
         """Normaliza una fila de movimiento y calcula su movement_hash.
 
-        feed="anteriores": movimientos liquidados (hash natural por sus campos).
-        feed="dia": movimientos del día corriente (provisionales). El hash se
-            namespacea con prefijo "dia" para no confundirse con su versión
-            liquidada (que llega al día hábil siguiente con otros campos y otro
-            hash). Es DETERMINÍSTICO sobre los campos del movimiento (incluido
-            process_date con hora exacta) -> el MISMO movimiento conserva su
-            movement_hash entre ciclos, así el upsert (MERGE) actualiza la fila
-            in-place y `movement_id` NO cambia. Esto es crítico para el
-            consumidor (app de cobros): si el id/hash mutara cada ciclo, su
-            conciliación perdería el vínculo. Riesgo de colisión: dos
-            movimientos idénticos en todos esos campos (mismo segundo, importe,
-            código, sucursal, cuenta) colapsarían en una fila; es rarísimo y
-            determinístico (mismo colapso cada ciclo, sin inestabilidad).
+        feed="anteriores": movimientos liquidados (hash natural por sus campos,
+            con voucher_number + correlative_number que IB ya asigna -> únicos).
+        feed="dia": movimientos del día corriente (provisionales). IB NO les
+            asigna voucher_number ni correlative_number, así que dos movimientos
+            distintos pero idénticos (mismo segundo, importe, código, sucursal,
+            cuenta) tendrían los mismos campos. Para que el hash sea ÚNICO (no
+            colapsar/perder filas) y a la vez ESTABLE entre ciclos, agregamos
+            `seq`: un índice de desempate DENTRO del grupo de idénticos (0,1,2…),
+            asignado por orden de aparición. Como el feed del día es
+            append-only, los movimientos existentes conservan su `seq` entre
+            ciclos -> mismo hash -> el MERGE actualiza in-place y `movement_id`
+            NO cambia (crítico para la conciliación del consumidor). El prefijo
+            "dia" evita colisión con la versión liquidada del mismo movimiento.
         """
         r = self._normalize_row(row)
         if feed == "dia":
@@ -491,7 +501,7 @@ class IBProcessor:
                 "dia", r.get("source_account"), r.get("process_date"),
                 r.get("amount"), r.get("debit_credit_type"),
                 r.get("operation_code_ib"), r.get("branch_office_activity"),
-                r.get("voucher_number"), r.get("correlative_number"),
+                r.get("voucher_number"), r.get("correlative_number"), seq,
             )
         else:
             r["movement_hash"] = _sha256(
@@ -565,6 +575,7 @@ class IBProcessor:
             # a 'anteriores', o se revirtieron), comparando contra los hashes
             # vigentes de este ciclo.
             batch_dia: List[Dict[str, Any]] = []
+            dia_seq: Dict[tuple, int] = {}
             for _, acc in accounts_df.iterrows():
                 try:
                     dia_df, _ = self.client.get_movimientos(
@@ -581,7 +592,17 @@ class IBProcessor:
                     continue
                 counter["read"] += len(dia_df)
                 for _, row in dia_df.iterrows():
-                    batch_dia.append(self._build_movement_row(row, acc, "dia"))
+                    # seq: índice de desempate dentro del grupo de movimientos
+                    # idénticos (mismos campos del hash). Da unicidad sin perder
+                    # estabilidad: el feed del día es append-only, así que un
+                    # movimiento ya visto conserva su seq -> mismo hash entre
+                    # ciclos. source_account está en la clave, así que el
+                    # contador global no mezcla cuentas.
+                    rn = self._normalize_row(row)
+                    key = self._dia_group_key(rn)
+                    seq = dia_seq.get(key, 0)
+                    dia_seq[key] = seq + 1
+                    batch_dia.append(self._build_movement_row(row, acc, "dia", seq))
 
             with self.db.connect() as conn:
                 cur = conn.cursor()
@@ -597,9 +618,11 @@ class IBProcessor:
                     # revertidas), vía temp table de hashes vigentes.
                     cur.execute("CREATE TABLE #dia_vigentes (h CHAR(64) PRIMARY KEY)")
                     cur.fast_executemany = True
+                    # dedup defensivo: con el seq los hashes ya son únicos, pero
+                    # un set evita cualquier violación de PK en la temp.
                     cur.executemany(
                         "INSERT INTO #dia_vigentes (h) VALUES (?)",
-                        [(r["movement_hash"],) for r in batch_dia],
+                        [(h,) for h in {r["movement_hash"] for r in batch_dia}],
                     )
                     cur.execute(
                         "DELETE m FROM finance.ib_movements m "
