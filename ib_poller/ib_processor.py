@@ -467,27 +467,31 @@ class IBProcessor:
                          int((_utcnow_naive() - started).total_seconds() * 1000))
 
     def _build_movement_row(
-        self, row: "pd.Series", acc: "pd.Series", feed: str, idx: int
+        self, row: "pd.Series", acc: "pd.Series", feed: str
     ) -> Dict[str, Any]:
         """Normaliza una fila de movimiento y calcula su movement_hash.
 
         feed="anteriores": movimientos liquidados (hash natural por sus campos).
-        feed="dia": movimientos del día corriente. IB NO les asigna
-            voucher_number, correlative_number ni movement_date, y su
-            process_date trae la hora exacta de imputación. Cuando ese mismo
-            movimiento se asiente en 'anteriores' (al día hábil siguiente)
-            tendrá otros campos -> otro hash. Para que las filas provisionales
-            'dia' NO colisionen ni se confundan con su versión liquidada,
-            namespaceamos el hash con prefijo "dia" + el índice de lote. Como
-            las filas 'dia' se borran y reescriben enteras cada ciclo, el
-            índice no necesita ser estable entre ciclos.
+        feed="dia": movimientos del día corriente (provisionales). El hash se
+            namespacea con prefijo "dia" para no confundirse con su versión
+            liquidada (que llega al día hábil siguiente con otros campos y otro
+            hash). Es DETERMINÍSTICO sobre los campos del movimiento (incluido
+            process_date con hora exacta) -> el MISMO movimiento conserva su
+            movement_hash entre ciclos, así el upsert (MERGE) actualiza la fila
+            in-place y `movement_id` NO cambia. Esto es crítico para el
+            consumidor (app de cobros): si el id/hash mutara cada ciclo, su
+            conciliación perdería el vínculo. Riesgo de colisión: dos
+            movimientos idénticos en todos esos campos (mismo segundo, importe,
+            código, sucursal, cuenta) colapsarían en una fila; es rarísimo y
+            determinístico (mismo colapso cada ciclo, sin inestabilidad).
         """
         r = self._normalize_row(row)
         if feed == "dia":
             r["movement_hash"] = _sha256(
                 "dia", r.get("source_account"), r.get("process_date"),
                 r.get("amount"), r.get("debit_credit_type"),
-                r.get("operation_code_ib"), r.get("branch_office_activity"), idx,
+                r.get("operation_code_ib"), r.get("branch_office_activity"),
+                r.get("voucher_number"), r.get("correlative_number"),
             )
         else:
             r["movement_hash"] = _sha256(
@@ -536,7 +540,7 @@ class IBProcessor:
                 )
                 counter["read"] += len(movements_df)
                 for _, row in movements_df.iterrows():
-                    batch.append(self._build_movement_row(row, acc, "anteriores", 0))
+                    batch.append(self._build_movement_row(row, acc, "anteriores"))
 
             if batch:
                 with self.db.connect() as conn:
@@ -552,10 +556,14 @@ class IBProcessor:
             # IB sólo expone los movimientos del día en curso en el feed 'dia';
             # recién pasan a 'anteriores' al día hábil siguiente. Sin esta fase
             # el día corriente nunca se sincroniza (lag de ~1 día). Las filas
-            # 'dia' son PROVISIONALES: las marcamos con movement_source='dia' y
-            # las borramos/reescribimos enteras cada ciclo. Al asentarse en
-            # 'anteriores' (con su hash definitivo) el DELETE de la fila 'dia'
-            # del día previo evita el duplicado.
+            # 'dia' son PROVISIONALES (movement_source='dia') pero con IDENTIDAD
+            # ESTABLE entre ciclos: hash determinístico + upsert (MERGE) que
+            # actualiza in-place conservando movement_id. NO se borran y
+            # reinsertan enteras (eso cambiaba movement_id/hash cada ciclo y
+            # rompía la conciliación del consumidor). Limpieza: se borran sólo
+            # las filas 'dia' que YA NO están en el feed (se asentaron y pasaron
+            # a 'anteriores', o se revirtieron), comparando contra los hashes
+            # vigentes de este ciclo.
             batch_dia: List[Dict[str, Any]] = []
             for _, acc in accounts_df.iterrows():
                 try:
@@ -572,21 +580,38 @@ class IBProcessor:
                     )
                     continue
                 counter["read"] += len(dia_df)
-                for idx, (_, row) in enumerate(dia_df.iterrows()):
-                    batch_dia.append(self._build_movement_row(row, acc, "dia", idx))
+                for _, row in dia_df.iterrows():
+                    batch_dia.append(self._build_movement_row(row, acc, "dia"))
 
             with self.db.connect() as conn:
                 cur = conn.cursor()
-                # Reemplazo total de las filas provisionales en UNA transacción
-                # (borrar + reinsertar) para no dejar el día corriente vacío.
-                cur.execute(
-                    "DELETE FROM finance.ib_movements WHERE movement_source = 'dia'"
-                )
                 if batch_dia:
+                    # Upsert estable (MERGE): conserva movement_id de las filas
+                    # 'dia' que persisten entre ciclos.
                     counter["upserted"] += execute_upsert_batch(
                         cur, "finance.ib_movements",
                         _IB_MOVEMENTS_KEYS, _IB_MOVEMENTS_UPDATE,
                         batch_dia, extra_set=None,
+                    )
+                    # Borrar las 'dia' que ya no están en el feed (asentadas o
+                    # revertidas), vía temp table de hashes vigentes.
+                    cur.execute("CREATE TABLE #dia_vigentes (h CHAR(64) PRIMARY KEY)")
+                    cur.fast_executemany = True
+                    cur.executemany(
+                        "INSERT INTO #dia_vigentes (h) VALUES (?)",
+                        [(r["movement_hash"],) for r in batch_dia],
+                    )
+                    cur.execute(
+                        "DELETE m FROM finance.ib_movements m "
+                        "WHERE m.movement_source = 'dia' "
+                        "AND NOT EXISTS (SELECT 1 FROM #dia_vigentes d "
+                        "WHERE d.h = m.movement_hash)"
+                    )
+                    cur.execute("DROP TABLE #dia_vigentes")
+                else:
+                    # Feed vacío: no hay provisionales hoy; limpiar remanentes.
+                    cur.execute(
+                        "DELETE FROM finance.ib_movements WHERE movement_source = 'dia'"
                     )
                 conn.commit()
         return SyncStats(process, counter["read"], counter["upserted"],
