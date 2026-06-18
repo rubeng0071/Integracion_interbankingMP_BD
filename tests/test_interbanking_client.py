@@ -411,6 +411,14 @@ class TestAuthRetry401:
         assert len(c.session.calls) == 2          # reintentó una vez
         assert c._access_token is None            # invalidó el token cacheado
 
+    def test_401_consecutivos_se_recupera(self) -> None:
+        # Dos 401 seguidos (token invalido un par de veces) y luego 200:
+        # el retry multiple lo resuelve sin propagar.
+        c = self._client([self._Resp(401), self._Resp(401), self._Resp(200, {"ok": 1})])
+        out = c._authed_get("https://ib/api", None)
+        assert out.json() == {"ok": 1}
+        assert len(c.session.calls) == 3
+
     def test_sin_401_no_invalida_token(self) -> None:
         tok = SecretString("tok")
         c = _build()
@@ -422,8 +430,9 @@ class TestAuthRetry401:
         assert c._access_token is tok             # token intacto
 
     def test_401_persistente_propaga(self) -> None:
+        # 401 siempre: tras _MAX_401_RETRIES reintentos (4 calls totales) propaga.
         import requests
-        c = self._client([self._Resp(401), self._Resp(401)])
+        c = self._client([self._Resp(401)] * 5)
         with pytest.raises(requests.HTTPError):
             c._authed_get("https://ib/api", None)
-        assert len(c.session.calls) == 2          # un solo reintento, luego propaga
+        assert len(c.session.calls) == InterbankingClient._MAX_401_RETRIES + 1

@@ -534,6 +534,12 @@ class IBProcessor:
         b_dt, e_dt = _parse_dt(begin), _parse_dt(end)
         with self._sync_context(process, b_dt, e_dt) as counter:
             accounts_df, _ = self.client.get_cuentas()
+            # Fallos por cuenta (p.ej. 401 intermitente de IB en paginación
+            # profunda). NO abortan el ciclo: cada cuenta se procesa aislada y
+            # al final, si hubo alguno, se marca ERROR para visibilidad pero
+            # los datos de las cuentas OK (y la fase 'dia') ya quedaron escritos.
+            failed_accounts: List[str] = []
+
             # --- Fase 1: 'anteriores' (movimientos liquidados) ---
             # Acumulamos todos los movimientos en memoria y hacemos UN solo
             # batch upsert al final. movements suele ser el sub-proceso mas
@@ -542,12 +548,22 @@ class IBProcessor:
             # 3 sentencias SQL totales (clone, executemany, MERGE).
             batch: List[Dict[str, Any]] = []
             for _, acc in accounts_df.iterrows():
-                movements_df, _ = self.client.get_movimientos(
-                    account_number=str(acc["account_number"]),
-                    bank_number=acc["bank_number"],
-                    date_since=begin, date_until=end,
-                    movement_type="anteriores", version="v2",
-                )
+                acc_num = str(acc.get("account_number"))
+                try:
+                    movements_df, _ = self.client.get_movimientos(
+                        account_number=acc_num,
+                        bank_number=acc["bank_number"],
+                        date_since=begin, date_until=end,
+                        movement_type="anteriores", version="v2",
+                    )
+                except Exception as exc:
+                    # Una cuenta que falla (401 tras reintentos, timeout, etc.)
+                    # no debe tumbar las demás ni impedir la fase 'dia'.
+                    logger.warning(
+                        "anteriores falló para cuenta %s: %s; continuando", acc_num, exc,
+                    )
+                    failed_accounts.append(f"anteriores:{acc_num}")
+                    continue
                 counter["read"] += len(movements_df)
                 for _, row in movements_df.iterrows():
                     batch.append(self._build_movement_row(row, acc, "anteriores"))
@@ -577,18 +593,19 @@ class IBProcessor:
             batch_dia: List[Dict[str, Any]] = []
             dia_seq: Dict[tuple, int] = {}
             for _, acc in accounts_df.iterrows():
+                acc_num = str(acc.get("account_number"))
                 try:
                     dia_df, _ = self.client.get_movimientos(
-                        account_number=str(acc["account_number"]),
+                        account_number=acc_num,
                         bank_number=acc["bank_number"],
                         date_since="", date_until="",
                         movement_type="dia", version="v2",
                     )
                 except Exception as exc:
                     logger.warning(
-                        "feed 'dia' falló para cuenta %s: %s; continuando",
-                        acc.get("account_number"), exc,
+                        "feed 'dia' falló para cuenta %s: %s; continuando", acc_num, exc,
                     )
+                    failed_accounts.append(f"dia:{acc_num}")
                     continue
                 counter["read"] += len(dia_df)
                 for _, row in dia_df.iterrows():
@@ -637,6 +654,15 @@ class IBProcessor:
                         "DELETE FROM finance.ib_movements WHERE movement_source = 'dia'"
                     )
                 conn.commit()
+
+            # Visibilidad: si alguna cuenta falló, marcamos el ciclo ERROR
+            # (alerta). Los datos de las cuentas OK y de la fase 'dia' ya se
+            # commitearon arriba; esto solo señala que el ciclo fue parcial.
+            if failed_accounts:
+                raise RuntimeError(
+                    f"{len(failed_accounts)} cuenta(s) fallaron en movements: "
+                    + ", ".join(failed_accounts)
+                )
         return SyncStats(process, counter["read"], counter["upserted"],
                          int((_utcnow_naive() - started).total_seconds() * 1000))
 

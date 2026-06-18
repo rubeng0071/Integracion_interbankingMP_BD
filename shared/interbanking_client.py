@@ -719,21 +719,35 @@ class InterbankingClient:
         self._access_token = None
         self._token_expires_at = None
 
+    # Reintentos ante 401 en un mismo GET (refrescando token). IB invalida el
+    # token de forma intermitente en paginación profunda (cuentas con muchas
+    # páginas), a veces en 401 consecutivos; un solo reintento no alcanzaba.
+    _MAX_401_RETRIES = 3
+
     def _authed_get(self, url: str, params: Optional[Dict[str, Any]]) -> Any:
-        """GET autenticado con retry único ante 401 (refresca token y reintenta).
+        """GET autenticado con retry ante 401 (refresca token y reintenta).
 
         El 401 de IB no está en el status_forcelist del Retry de urllib3 (que
-        cubre 429/5xx), así que lo manejamos acá: ante 401, invalidamos el
-        token, pedimos uno nuevo y reintentamos una sola vez. Si vuelve a
-        fallar, propaga. Devuelve el Response ya con raise_for_status aplicado.
+        cubre 429/5xx), así que lo manejamos acá: ante 401, invalidamos el token
+        cacheado, pedimos uno nuevo y reintentamos, hasta `_MAX_401_RETRIES`
+        veces. Si sigue en 401, propaga. Devuelve el Response ya con
+        raise_for_status aplicado.
         """
-        response = self.session.get(url, headers=self._api_headers(), params=params, timeout=self.timeout)
-        if response.status_code == 401:
-            logger.warning("IB respondió 401 en %s; refrescando token y reintentando una vez", url)
-            self._invalidate_token()
-            response = self.session.get(url, headers=self._api_headers(), params=params, timeout=self.timeout)
-        response.raise_for_status()
-        return response
+        attempt = 0
+        while True:
+            response = self.session.get(
+                url, headers=self._api_headers(), params=params, timeout=self.timeout
+            )
+            if response.status_code == 401 and attempt < self._MAX_401_RETRIES:
+                attempt += 1
+                logger.warning(
+                    "IB respondió 401 en %s (intento %d/%d); refrescando token y reintentando",
+                    url, attempt, self._MAX_401_RETRIES,
+                )
+                self._invalidate_token()
+                continue
+            response.raise_for_status()
+            return response
 
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         url = f"{self.api_base_url}{path}"
