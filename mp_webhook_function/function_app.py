@@ -41,6 +41,7 @@ import hmac
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -52,6 +53,7 @@ from shared.config import ConfigError, MpWebhookConfig
 from shared.observability import configure_logging
 from shared.secret_string import SecretString
 
+from db_conn import ThreadLocalConnection
 from mp_client import MercadoPagoClient, MercadoPagoError
 from mp_processor import upsert_payment
 
@@ -65,6 +67,8 @@ logger = logging.getLogger(__name__)
 
 _cached_config: Optional[MpWebhookConfig] = None
 _cached_mp_client: Optional[MercadoPagoClient] = None
+_cached_db: Optional[ThreadLocalConnection] = None
+_db_init_lock = threading.Lock()
 
 
 def _get_config() -> MpWebhookConfig:
@@ -97,6 +101,21 @@ def _get_mp_client() -> MercadoPagoClient:
             access_token_override=cfg.mp_access_token,
         )
     return _cached_mp_client
+
+
+def _get_db() -> ThreadLocalConnection:
+    """Wrapper de conexión único, reutilizado entre invocaciones warm.
+
+    Reemplaza el `pyodbc.connect` por mensaje (un login TCP+TLS por cada pago)
+    por una conexión reutilizada por hilo. Mantiene la semántica transaccional
+    del worker: commit solo si el upsert sale bien, rollback + retry si no.
+    """
+    global _cached_db
+    if _cached_db is None:
+        with _db_init_lock:
+            if _cached_db is None:
+                _cached_db = ThreadLocalConnection(_get_config().sql_connection_string.reveal())
+    return _cached_db
 
 
 # =====================================================================
@@ -292,7 +311,9 @@ def mp_process_payment(msg: func.QueueMessage) -> None:
         return
 
     try:
-        config = _get_config()
+        # Fail-fast ante config inválida + bootstrap de observability (idempotente).
+        # La conn string la resuelve _get_db() por dentro.
+        _get_config()
     except ConfigError:
         logger.exception("[%s] config_error procesando payment_id=%s", invocation_id, payment_id)
         raise
@@ -305,13 +326,11 @@ def mp_process_payment(msg: func.QueueMessage) -> None:
         raise
 
     try:
-        with pyodbc.connect(config.sql_connection_string.reveal(), autocommit=False) as conn:
-            try:
-                result = upsert_payment(conn, payment)
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
+        # Conexión reutilizada por hilo (evita un login TCP+TLS por mensaje).
+        # transaction() commitea si sale bien y hace rollback + re-lanza si falla,
+        # así el runtime reintenta el mensaje y no se pierde ningún pago.
+        with _get_db().transaction() as conn:
+            result = upsert_payment(conn, payment)
     except pyodbc.Error:
         logger.exception("[%s] Error de DB procesando payment %s", invocation_id, payment_id)
         raise
