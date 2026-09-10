@@ -55,7 +55,7 @@ from shared.secret_string import SecretString
 
 from db_conn import ThreadLocalConnection
 from mp_client import MercadoPagoClient, MercadoPagoError
-from mp_processor import upsert_payment
+from mp_processor import parse_dt, upsert_payment
 
 logger = logging.getLogger(__name__)
 
@@ -370,30 +370,38 @@ def _poller_window(config: MpWebhookConfig, now: Optional[datetime] = None) -> T
     return begin, now
 
 
-def collect_payment_ids(
+# Lote para el IN (...) de load_stored_last_updated. SQL Server admite hasta 2100
+# parámetros por sentencia; 500 deja amplio margen y cada lote es un seek por PK.
+_STORED_BATCH = 500
+
+
+def collect_payment_candidates(
     client: MercadoPagoClient,
     begin: datetime,
     end: datetime,
     page_delay_seconds: float = 0.2,
     max_pages: int = _MAX_PAGES_PER_RUN,
     page_size: int = 50,
-) -> List[str]:
-    """Recolecta los payment_ids del rango sin duplicados, vía slicing por fecha.
+) -> List[Tuple[str, Optional[datetime]]]:
+    """Recolecta (payment_id, date_last_updated) del rango, vía slicing por fecha.
 
     Delega en `client.iter_all_payments`, que esquiva el cap de offset 10_000 de MP
     partiendo el rango de fechas (sin esto, una ventana con >10_000 matches perdía el
     resto en silencio). El poller incremental usa `range=date_last_updated` para
     capturar tanto altas como actualizaciones.
 
-    Función pura (sin side effects de queue/SQL) para que sea testeable. El timer
-    trigger la invoca y después delega el encolado al binding queue_output.
+    Devuelve el `date_last_updated` ya parseado con `parse_dt` (mismo criterio que el
+    worker), para que `select_changed` pueda decidir qué encolar sin volver a tocar MP.
 
-    Cap defensivo: `max_pages * page_size` ids por ciclo. Evita quemar el
+    Función pura (sin side effects de queue/SQL) para que sea testeable. El timer
+    trigger la invoca, filtra con SQL y después delega el encolado al queue_output.
+
+    Cap defensivo: `max_pages * page_size` candidatos por ciclo. Evita quemar el
     functionTimeout si una ventana trae un universo inesperadamente grande; el resto
     entra en los próximos ciclos (o se hace via backfill dedicado).
     """
     max_ids = max_pages * page_size
-    enqueued: List[str] = []
+    candidates: List[Tuple[str, Optional[datetime]]] = []
 
     try:
         for payment in client.iter_all_payments(
@@ -406,24 +414,69 @@ def collect_payment_ids(
             pid = payment.get("id")
             if pid is None:
                 continue
-            enqueued.append(str(pid))
-            if len(enqueued) >= max_ids:
+            candidates.append((str(pid), parse_dt(payment.get("date_last_updated"))))
+            if len(candidates) >= max_ids:
                 logger.warning(
-                    "mp_poller: cap de %d ids alcanzado en [%s, %s]; corte defensivo "
+                    "mp_poller: cap de %d candidatos alcanzado en [%s, %s]; corte defensivo "
                     "(el resto entra en próximos ciclos)",
                     max_ids, begin.isoformat(), end.isoformat(),
                 )
                 break
     except MercadoPagoError:
         logger.exception(
-            "mp_poller: search falló; abortando ciclo (lo ya recolectado se encola igual)"
+            "mp_poller: search falló; abortando ciclo (lo ya recolectado se procesa igual)"
         )
 
     logger.info(
-        "mp_poller: ventana [%s, %s] encolados=%d",
-        begin.isoformat(), end.isoformat(), len(enqueued),
+        "mp_poller: ventana [%s, %s] candidatos=%d",
+        begin.isoformat(), end.isoformat(), len(candidates),
     )
-    return enqueued
+    return candidates
+
+
+def select_changed(
+    candidates: List[Tuple[str, Optional[datetime]]],
+    stored: Dict[str, datetime],
+) -> List[str]:
+    """Ids a encolar: los que cambiaron o ante CUALQUIER duda (función pura).
+
+    Misma regla que `mp_processor._is_already_current`: se saltea (no se encola) SOLO
+    si tenemos exactamente el mismo `date_last_updated` (no nulo) que MP. Si la fecha
+    del candidato no se pudo parsear, si el pago no está en SQL, o si el valor guardado
+    es nulo/distinto → se encola. `stored` trae solo ids con fecha no nula.
+    """
+    changed: List[str] = []
+    for pid, dlu in candidates:
+        current = stored.get(pid)
+        if dlu is not None and current is not None and current == dlu:
+            continue  # ya está al día: el worker lo skipearía igual, no lo encolamos
+        changed.append(pid)
+    return changed
+
+
+def load_stored_last_updated(conn: "pyodbc.Connection", ids: List[str]) -> Dict[str, datetime]:
+    """Lee de SQL el `date_last_updated` guardado para esos ids, en lotes de 500.
+
+    Devuelve `{payment_id_str: datetime_naive}` solo para los pagos que existen con
+    valor no nulo (los ausentes o nulos se encolan por la regla de `select_changed`).
+    `payment_id` es BIGINT y PK: cada lote es un seek. Si la consulta falla, propaga
+    `pyodbc.Error` — el caller (mp_poller_run) lo captura y encola TODO (red de seguridad).
+    """
+    stored: Dict[str, datetime] = {}
+    cur = conn.cursor()
+    for i in range(0, len(ids), _STORED_BATCH):
+        chunk = ids[i:i + _STORED_BATCH]
+        placeholders = ",".join(["?"] * len(chunk))
+        rows = cur.execute(
+            f"SELECT payment_id, date_last_updated FROM finance.mp_payments "
+            f"WHERE payment_id IN ({placeholders})",
+            *chunk,
+        ).fetchall()
+        for payment_id, dlu in rows:
+            if dlu is None:
+                continue
+            stored[str(payment_id)] = dlu.replace(tzinfo=None) if isinstance(dlu, datetime) else dlu
+    return stored
 
 
 @app.timer_trigger(
@@ -454,18 +507,44 @@ def mp_poller_run(timer: func.TimerRequest, msg_out: func.Out[List[str]]) -> Non
 
     begin, end = _poller_window(config)
     delay_seconds = max(config.mp_search_page_delay_ms, 0) / 1000.0
-    enqueued = collect_payment_ids(
+    candidates = collect_payment_candidates(
         client=_get_mp_client(),
         begin=begin,
         end=end,
         page_delay_seconds=delay_seconds,
     )
 
-    if not enqueued:
+    if not candidates:
         logger.info(
-            "mp_poller: ventana [%s, %s] sin pagos para encolar",
+            "mp_poller: ventana [%s, %s] sin pagos",
             begin.isoformat(), end.isoformat(),
         )
+        return
+
+    ids = [pid for pid, _ in candidates]
+
+    # Pre-filtro: no encolar pagos que ya están al día en SQL (evita el ~88% de
+    # ejecuciones inútiles del worker, cada una con su login a la base).
+    # RED DE SEGURIDAD: si la lectura de SQL falla, se encola TODO, igual que antes.
+    # Un error de base nunca puede hacer que el poller encole de menos.
+    try:
+        with _get_db().transaction() as conn:
+            stored = load_stored_last_updated(conn, ids)
+        enqueued = select_changed(candidates, stored)
+    except pyodbc.Error:
+        logger.warning(
+            "mp_poller: no se pudo leer date_last_updated de SQL; encolo TODO (red de seguridad)",
+            exc_info=True,
+        )
+        enqueued = ids
+
+    logger.info(
+        "mp_poller: candidatos=%d encolados=%d (ya al día=%d)",
+        len(ids), len(enqueued), len(ids) - len(enqueued),
+    )
+
+    if not enqueued:
+        logger.info("mp_poller: nada nuevo que encolar (todo estaba al día)")
         return
 
     # Materializar la encolada en batch. El binding queue_output con List[str]
