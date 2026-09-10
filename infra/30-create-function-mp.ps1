@@ -42,6 +42,16 @@ az functionapp config set --name $Name --resource-group $ResourceGroup `
     --min-tls-version 1.2 --output none
 Write-Ok "Aplicado"
 
+# ---------- Techo de escalado (functionAppScaleLimit) ----------
+# Cap defensivo: en picos se observaron ~6 instancias, asi que 10 no frena la
+# carga actual pero corta un escalado desbocado. No hay flag directo en
+# 'az functionapp'; se setea sobre config/web. Idempotente (re-set a 10 = no-op).
+Write-Step "Techo de escalado: functionAppScaleLimit=10"
+az resource update --resource-group $ResourceGroup `
+    --name "$Name/config/web" --resource-type "Microsoft.Web/sites" `
+    --set properties.functionAppScaleLimit=10 --output none
+Write-Ok "Aplicado"
+
 # ---------- System-assigned MI ----------
 Write-Step "System-assigned Managed Identity"
 $principalId = az functionapp identity show `
